@@ -96,7 +96,6 @@ ipython_config.py
 
 # Dependency managers
 Pipfile.lock
-poetry.lock
 
 # PEP 582
 __pypackages__/
