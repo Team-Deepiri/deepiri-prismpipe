@@ -1,4 +1,4 @@
-# PrismPipe — Capability-Routed API Pipeline
+# Deepiri PrismPipe — Capability-Routed API Pipeline
 
 <p align="center">
   <strong>Transform ordinary API requests into a mutable, capability-driven pipeline</strong>
