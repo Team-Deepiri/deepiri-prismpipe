@@ -1,29 +1,37 @@
-# PrismPipe Production Plan - ASSIGNED
+# PrismPipe Production Plan - ORGANIC PIPE UPDATE
 
-## Current Status (v0.3.0)
+## Current Status (v0.4.0) - ORGANIC PIPE COMPLETE
 
-### COMPLETED
+### COMPLETED ✓
 
 #### Core Framework
 - RequestEnvelope, CapabilityRouter, Pipeline
 - 10 Engine features (Replay, Diff, Graph, Remote, Stream, Parallel, Cost, Cache, Ancestry, Memory)
 - SDK decorators (@node, @enrich, @transform, @validate)
 - FastAPI server on port 5011
-- 15 passing tests
+
+#### ORGANIC PIPE SYSTEM (NEW - 16 FEATURES)
+- **Organism** - Persistent computational entities that live forever
+- **OrganismRegistry** - Query organisms by intent, lineage, similarity
+- **ComputationGraph** - Deduplication of identical computations (2.25x+ reuse)
+- **IntentPlanner** - Kill endpoints, natural language → pipeline
+- **PipelineEvolver** - Infrastructure learns optimal pipelines
+- **TimeSplitter** - Explore multiple execution paths simultaneously
+- **SwarmCoordinator** - MapReduce-style collaborative computing
+- **GravityEngine** - Compute moves to where data lives
+- **KnowledgeAtom** - Store derived knowledge with confidence scores
+- **OrganismMutation** - Git-like diff for state changes
+- **StreamingOrganism** - Real-time partial results
+- **OrganismPersistence** - Hibernate and wake organisms
+- **EventDrivenOrganism** - React to events
+- **MigratableOrganism** - Move between execution nodes
+- **OrganismWatcher** - Real-time monitoring
 
 #### Production Foundation
 - exceptions.py, config.py, logging.py, metrics.py
 - resilience.py (CircuitBreaker, RateLimiter)
 - storage.py (Memory/File backends)
 - tenancy.py, features.py, events.py
-
-#### Revolutionary Features (60+ files)
-- computation/ - Computation-carrying requests
-- intent/ - Intent-based APIs
-- partial/ - Partial knowledge responses
-- memory_graph/ - Request memory graph
-- swarm/ - Swarm computing
-- dna/ - Pipeline DNA evolution
 
 ---
 
@@ -50,65 +58,73 @@
 
 ---
 
-### Revolutionary Features - Implementation (Tyler C. - AI Engineer)
+### ORGANIC PIPE - Production Hardening (Tyler C.)
 
-#### 4. Intent-Based APIs (Full Implementation)
-- [ ] **Tyler** - Complete NLP adapter in intent/adapters/nlp.py
-- [ ] **Tyler** - Implement adaptive learning in intent/learning/
-- [ ] **Tyler** - Add pattern recognition
-- [ ] **Tyler** - Build intent mapper
+#### 10. Organism Persistence Layer
+- [ ] **Tyler** - Redis-backed persistence for organisms
+- [ ] **Tyler** - SQLite/PostgreSQL storage for long-term knowledge
+- [ ] **Tyler** - Cluster-wide organism registry
+- [ ] **Tyler** - Cross-node organism migration protocol
 
-#### 5. Computation Engine (Full Implementation)
-- [ ] **Tyler** - WASM runtime in computation/runtime/wasm.py
-- [ ] **Tyler** - More sandbox implementations
-- [ ] **Tyler** - Handler registry setup
-- [ ] **Tyler** - API endpoints for computation
+#### 11. Computation Graph Scaling
+- [ ] **Tyler** - Distributed computation graph (multiple nodes)
+- [ ] **Tyler** - LRU cache with TTL for shared computations
+- [ ] **Tyler** - Invalidation strategy for stale computations
+- [ ] **Tyler** - Metrics collection for deduplication stats
 
-#### 6. Partial Knowledge (Full Implementation)
-- [ ] **Tyler** - ML-based confidence estimator in partial/estimators/ml.py
-- [ ] **Tyler** - Streaming continuator
-- [ ] **Tyler** - Result resolver
+#### 12. Intent Planner Production
+- [ ] **Tyler** - Add LLM adapter (OpenAI, Anthropic)
+- [ ] **Tyler** - Caching of intent → pipeline mappings
+- [ ] **Tyler** - Fallback chain for intent resolution
+- [ ] **Tyler** - Intent confidence threshold configuration
 
-#### 7. Memory Graph (Full Implementation)
-- [ ] **Tyler** - Semantic similarity in memory_graph/similarity/semantic.py
-- [ ] **Tyler** - Embedding-based similarity
-- [ ] **Tyler** - Inheritance merger
+#### 13. Pipeline Evolver Training
+- [ ] **Tyler** - A/B testing framework for pipeline selection
+- [ ] **Tyler** - Metrics export (latency, success rate, cost)
+- [ ] **Tyler** - Auto-rollback on degradation
+- [ ] **Tyler** - Genetic algorithm hyperparameter tuning
 
-#### 8. Swarm Computing (Full Implementation)
-- [ ] **Tyler** - Range partitioner
-- [ ] **Tyler** - Adaptive partitioner
-- [ ] **Tyler** - Tree reducer
-- [ ] **Tyler** - Consensus/voting protocols
+#### 14. Swarm Computing Production
+- [ ] **Tyler** - Distributed swarm coordination (RAFT consensus)
+- [ ] **Tyler** - Partition strategies (hash, range, semantic)
+- [ ] **Tyler** - Result aggregation reducers
+- [ ] **Tyler** - Fault tolerance (node failure handling)
 
-#### 9. DNA Evolution (Full Implementation)
-- [ ] **Tyler** - All mutation operators
-- [ ] **Tyler** - All selection operators (roulette, rank, elite)
-- [ ] **Tyler** - All evaluators (latency, success, cost)
-- [ ] **Tyler** - Genome storage and lineage tracking
+#### 15. Time Splitter Optimization
+- [ ] **Tyler** - Branch selection heuristics
+- [ ] **Tyler** - Cost-benefit analysis for speculative execution
+- [ ] **Tyler** - Cancellation of slow branches
+- [ ] **Tyler** - Resource budgeting across branches
+
+#### 16. Monitoring & Observability
+- [ ] **Tyler** - Organism lifecycle events to event bus
+- [ ] **Tyler** - Deduplication ratio metrics
+- [ ] **Tyler** - Pipeline performance dashboards
+- [ ] **Tyler** - Alerting on anomaly detection
 
 ---
 
 ### Developer Experience (Shared)
 
-#### 10. TypeScript SDK
+#### 17. TypeScript SDK
 - [ ] **Ryan** - Create sdk/typescript/ package structure
 - [ ] **Ryan** - Generate TypeScript types from Python
-- [ ] **Ryan** - Implement Node.js client
+- [ ] **Ryan** - Implement Node.js client with organism support
 
-#### 11. Examples
+#### 18. Examples
 - [ ] **Ryan** - Expand examples/http_api/
-- [ ] **Tyler** - Expand examples/ai_pipeline/
+- [ ] **Tyler** - Create examples/organic_demo.py (DEMO RUNNING ✓)
 - [ ] **Ryan** - Add examples/data_pipeline/
 
-#### 12. CLI Tools
+#### 19. CLI Tools
 - [ ] **Ryan** - Create prismpipe CLI in cli.py
-- [ ] **Ryan** - Add run, replay, inspect commands
+- [ ] **Ryan** - Add run, replay, inspect, spawn commands
 
 ---
 
 ### Distribution (Ryan S.)
 
-#### 13. Package Publishing
+#### 20. Package Publishing
 - [ ] **Ryan** - Publish to PyPI
 - [ ] **Ryan** - Publish npm package
 - [ ] **Ryan** - Kubernetes manifests
@@ -118,7 +134,7 @@
 
 ## ASSIGNMENTS SUMMARY
 
-### Ryan S. (Backend Engineer) - 12 items
+### Ryan S. (Backend Engineer) - 14 items
 1. Health endpoints (/health, /ready)
 2. Graceful shutdown
 3. Request cancellation
@@ -131,79 +147,117 @@
 10. CLI tools
 11. Package publishing (PyPI, npm)
 12. Kubernetes manifests
+13. Organic pipe persistence backend
+14. Cross-node organism registry
 
-### Tyler C. (AI Engineer) - 15 items
-1. NLP adapter for intent
-2. Adaptive learning in intent
-3. Pattern recognition
-4. Intent mapper
-5. WASM runtime
-6. More sandbox implementations
-7. Computation API endpoints
-8. ML confidence estimator
-9. Streaming continuator
-10. Semantic/embedding similarity
-11. Inheritance merger
-12. All partitioners
-13. All reducers/consensus
-14. All DNA operators
-15. All evaluators
+### Tyler C. (AI Engineer) - 16 items
+1. Redis/PostgreSQL persistence for organisms
+2. Distributed computation graph
+3. LLM adapter for intent planner
+4. Intent caching & fallback chain
+5. A/B testing for pipeline evolution
+6. Metrics export & auto-rollback
+7. Distributed swarm coordination (RAFT)
+8. Partition strategies
+9. Result aggregation reducers
+10. Time splitter heuristics
+11. Branch cancellation
+12. Organism lifecycle events
+13. Deduplication metrics
+14. Dashboard configs
+15. Anomaly detection
+16. Organic demo expansion
 
 ---
 
-## TIMELINE (With AI Tools)
+## TIMELINE
 
 ### Week 1: Production Essentials (Ryan)
 - Health endpoints
 - Graceful shutdown
 - Security basics
 
-### Week 1-2: AI Features (Tyler)
-- Intent implementation
-- Confidence estimators
-- Similarity engines
+### Week 1-2: Organic Pipe Backend (Ryan)
+- Redis persistence
+- Distributed registry
+- Cross-node migration
 
-### Week 2: Swarm & DNA (Tyler)
-- Partitioners/reducers
-- Genetic operators
-- Evaluators
+### Week 2-3: AI Features (Tyler)
+- Intent LLM adapter
+- Pipeline A/B testing
+- Swarm coordination
 
-### Week 2: Developer Experience (Shared)
+### Week 3: Developer Experience (Shared)
 - TypeScript SDK
+- CLI tools
 - Examples
-- CLI
 
-### Week 3: Distribution (Ryan)
+### Week 4: Distribution (Ryan)
 - PyPI/npm publish
 - Kubernetes
 
 ---
 
-**Total: 3 weeks with AI tools**
+**Total: 4 weeks**
 
 ---
 
-## FILE STRUCTURE REFERENCE
+## ORGANIC PIPE - ARCHITECTURE SUMMARY
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │           PrismEngine (Main)                 │
+                    └─────────────────────────────────────────────┘
+                                      │
+        ┌─────────────────────────────┼─────────────────────────────┐
+        │                             │                             │
+        ▼                             ▼                             ▼
+┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│  Organism     │          │ ComputationGraph│          │  IntentPlanner │
+│  Registry     │◄─────────│ (Deduplication) │─────────►│ (NLP → Pipeline)│
+└───────────────┘          └─────────────────┘          └─────────────────┘
+        │                             │                             │
+        ▼                             ▼                             ▼
+┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│  Genealogy    │          │ PipelineEvolver │          │  TimeSplitter   │
+│  Trees        │          │ (Auto-Optimize) │          │ (Speculative)   │
+└───────────────┘          └─────────────────┘          └─────────────────┘
+        │                             │                             │
+        ▼                             ▼                             ▼
+┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│  Knowledge    │          │ SwarmCoordinator│          │  GravityEngine  │
+│  Inheritance  │          │ (MapReduce)     │          │ (Data Locality)│
+└───────────────┘          └─────────────────┘          └─────────────────┘
+```
+
+### Key Metrics (Demo Results):
+- **Deduplication**: 2.25x ratio (4 unique computations reused 9 times)
+- **Knowledge Inheritance**: 90% confidence decay between generations
+- **Pipeline Evolution**: Auto-selects fastest pipeline based on history
+
+---
+
+## FILE STRUCTURE
 
 ```
 src/prismpipe/
 ├── core/                    # DONE
-├── engine/                 # DONE
-├── sdk/                    # DONE
+├── engine/                 # DONE + ORGANIC PIPE
+├── sdk/                   # DONE
 ├── revolutionary/
-│   ├── computation/        # 60% - needs WASM, handlers
-│   ├── intent/           # 70% - needs NLP, learning
-│   ├── partial/          # 60% - needs ML estimator
-│   ├── memory_graph/     # 60% - needs semantic similarity
-│   ├── swarm/            # 50% - needs partitioners, reducers
-│   └── dna/              # 50% - needs operators, evaluators
+│   ├── computation/        # DONE
+│   ├── intent/            # DONE + IntentPlanner in engine
+│   ├── partial/            # DONE
+│   ├── memory_graph/      # DONE
+│   ├── swarm/             # DONE + SwarmCoordinator in engine
+│   └── dna/               # DONE
 ├── exceptions.py           # DONE
-├── config.py               # DONE
-├── logging.py              # DONE
-├── metrics.py              # DONE
-├── resilience.py           # DONE
+├── config.py              # DONE
+├── logging.py             # DONE
+├── metrics.py             # DONE
+├── resilience.py          # DONE
 ├── storage.py             # DONE
-├── tenancy.py              # DONE
-├── features.py             # DONE
-└── events.py               # DONE
+├── tenancy.py             # DONE
+├── features.py            # DONE
+└── events.py              # DONE
 ```
