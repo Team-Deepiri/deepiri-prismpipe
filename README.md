@@ -338,16 +338,8 @@ child = organism.spawn_child(patch_input={"filter": "active"})
 
 ---
 
-## Why This Is Actually New
+#** Our goal is basically just to optimize the lifecycle of requests.**
 
-Most systems optimize:
-- Services
-- Compute
-- Databases
-
-**Nobody optimizes the lifecycle of requests.**
-
-That's the gap Organic Pipe fills.
 
 ---
 
@@ -360,5 +352,4 @@ That's the gap Organic Pipe fills.
 ---
 
 ## License
-
-MIT License
+Apache 2.0
