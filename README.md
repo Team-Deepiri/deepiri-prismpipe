@@ -21,7 +21,7 @@ Even "advanced" systems like Kafka, Temporal, or Beam treat requests as temporar
 
 ---
 
-## The Revolutionary Idea: Organic Pipe
+## Our Idea: Organic Pipe
 
 What if **requests were not packets**?
 
