@@ -9,8 +9,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import uvicorn
 import os
+import time
 
 PORT = int(os.getenv("PORT", "5011"))
+START_TIME = time.monotonic()
 
 from prismpipe import PrismEngine, create_envelope
 from prismpipe.core import Intent, Node, NodeResult
@@ -199,8 +201,41 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "engine": "operational"}
+    return {
+        "status": "healthy",
+        "version": "0.2.0",
+        "timestamp": time.time(),
+        "uptime_seconds": round(time.monotonic() - START_TIME, 2),
+    }
 
+@app.get("/ready")
+async def ready():
+    try:
+        node_count = len(engine.router.list_capabilities())
+        if node_count == 0:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "reason": "No nodes registered",
+                    "timestamp": time.time(),
+                }
+            )
+
+        return {
+            "status": "ready",
+            "engine_nodes": node_count,
+            "timestamp": time.time(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": str(e),
+                "timestamp": time.time(),
+            }
+        )
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def handle_request(request: Request, path: str):
