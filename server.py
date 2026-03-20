@@ -13,6 +13,7 @@ import time
 import signal
 
 PORT = int(os.getenv("PORT", "5011"))
+HOST = os.getenv("HOST", "0.0.0.0")
 START_TIME = time.monotonic()
 _shutting_down = False
 
@@ -416,7 +417,7 @@ async def shutdown(sig: signal.Signals, server: uvicorn.Server) -> None:
     server.handle_exit(sig, None)
 
 def main() -> None:
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(PORT))
+    config = uvicorn.Config(app, host=HOST, port=PORT)
     server = uvicorn.Server(config)
 
     loop = asyncio.new_event_loop()
