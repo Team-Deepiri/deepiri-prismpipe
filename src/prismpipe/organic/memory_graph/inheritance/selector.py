@@ -1,7 +1,7 @@
 """Inheritance selector for memory graph."""
 
-from prismpipe.revolutionary.memory_graph.core.node import RequestNode
-from prismpipe.revolutionary.memory_graph.similarity.hash import HashSimilarity
+from prismpipe.organic.memory_graph.core.node import RequestNode
+from prismpipe.organic.memory_graph.similarity.hash import HashSimilarity
 
 
 class InheritanceSelector:

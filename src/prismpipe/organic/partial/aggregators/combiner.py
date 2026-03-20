@@ -1,6 +1,6 @@
 """Result combiner for merging partial results."""
 
-from prismpipe.revolutionary.partial.core.partial_result import PartialResult
+from prismpipe.organic.partial.core.partial_result import PartialResult
 
 
 class ResultCombiner:

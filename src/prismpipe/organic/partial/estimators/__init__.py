@@ -1,5 +1,5 @@
 """Partial estimators exports."""
 
-from prismpipe.revolutionary.partial.estimators.heuristic import HeuristicConfidenceEstimator
+from prismpipe.organic.partial.estimators.heuristic import HeuristicConfidenceEstimator
 
 __all__ = ["HeuristicConfidenceEstimator"]

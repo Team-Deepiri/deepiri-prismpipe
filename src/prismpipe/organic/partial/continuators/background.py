@@ -1,6 +1,6 @@
 """Background continuator for continuing partial tasks."""
 
-from prismpipe.revolutionary.partial.core.task import BackgroundTask
+from prismpipe.organic.partial.core.task import BackgroundTask
 
 
 class BackgroundContinuator:

@@ -1,7 +1,7 @@
 """Swarm coordinator for managing distributed tasks."""
 
-from prismpipe.revolutionary.swarm.core.swarm import SwarmEnvelope
-from prismpipe.revolutionary.swarm.core.result import SwarmResult
+from prismpipe.organic.swarm.core.swarm import SwarmEnvelope
+from prismpipe.organic.swarm.core.result import SwarmResult
 
 
 class SwarmCoordinator:

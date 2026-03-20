@@ -1,10 +1,10 @@
 """Intent package."""
 
-from prismpipe.revolutionary.intent.core.intent import Intent, IntentType
-from prismpipe.revolutionary.intent.core.path import CapabilityPath
-from prismpipe.revolutionary.intent.core.planner import PathPlanner
-from prismpipe.revolutionary.intent.learning.history import HistoryLearner
-from prismpipe.revolutionary.intent.registry.capability_registry import CapabilityRegistry
+from prismpipe.organic.intent.core.intent import Intent, IntentType
+from prismpipe.organic.intent.core.path import CapabilityPath
+from prismpipe.organic.intent.core.planner import PathPlanner
+from prismpipe.organic.intent.learning.history import HistoryLearner
+from prismpipe.organic.intent.registry.capability_registry import CapabilityRegistry
 
 __all__ = [
     "Intent",

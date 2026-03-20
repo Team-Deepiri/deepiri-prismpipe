@@ -1,6 +1,6 @@
 """Runtime package."""
 
-from prismpipe.revolutionary.computation.runtime.base import Runtime
-from prismpipe.revolutionary.computation.runtime.python import PythonRuntime
+from prismpipe.organic.computation.runtime.base import Runtime
+from prismpipe.organic.computation.runtime.python import PythonRuntime
 
 __all__ = ["Runtime", "PythonRuntime"]

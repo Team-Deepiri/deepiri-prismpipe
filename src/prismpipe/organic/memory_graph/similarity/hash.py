@@ -1,7 +1,7 @@
 """Hash-based similarity for memory graph."""
 
 import hashlib
-from prismpipe.revolutionary.memory_graph.core.node import RequestNode
+from prismpipe.organic.memory_graph.core.node import RequestNode
 
 
 class HashSimilarity:

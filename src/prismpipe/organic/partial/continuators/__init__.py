@@ -1,5 +1,5 @@
 """Partial continuators exports."""
 
-from prismpipe.revolutionary.partial.continuators.background import BackgroundContinuator
+from prismpipe.organic.partial.continuators.background import BackgroundContinuator
 
 __all__ = ["BackgroundContinuator"]

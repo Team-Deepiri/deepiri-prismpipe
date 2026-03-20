@@ -1,6 +1,6 @@
 """Memory graph for storing request relationships."""
 
-from prismpipe.revolutionary.memory_graph.core.node import RequestNode
+from prismpipe.organic.memory_graph.core.node import RequestNode
 
 
 class MemoryGraph:

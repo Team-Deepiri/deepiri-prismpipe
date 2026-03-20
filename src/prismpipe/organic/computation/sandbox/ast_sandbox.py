@@ -3,7 +3,7 @@
 import ast
 from typing import Any
 
-from prismpipe.revolutionary.computation.sandbox.base import Sandbox
+from prismpipe.organic.computation.sandbox.base import Sandbox
 
 
 # Forbidden AST nodes that could be dangerous

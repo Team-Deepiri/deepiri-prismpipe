@@ -1,5 +1,5 @@
 """Partial aggregators exports."""
 
-from prismpipe.revolutionary.partial.aggregators.combiner import ResultCombiner
+from prismpipe.organic.partial.aggregators.combiner import ResultCombiner
 
 __all__ = ["ResultCombiner"]

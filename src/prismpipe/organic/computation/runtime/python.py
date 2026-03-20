@@ -4,10 +4,10 @@ import ast
 import time
 from typing import Any
 
-from prismpipe.revolutionary.computation.core.payload import ComputationPayload, ExecutionContext, Language
-from prismpipe.revolutionary.computation.core.result import ExecutionResult, ExecutionStatus
-from prismpipe.revolutionary.computation.core.contract import ComputationContract, DEFAULT_CONTRACT
-from prismpipe.revolutionary.computation.runtime.base import Runtime
+from prismpipe.organic.computation.core.payload import ComputationPayload, ExecutionContext, Language
+from prismpipe.organic.computation.core.result import ExecutionResult, ExecutionStatus
+from prismpipe.organic.computation.core.contract import ComputationContract, DEFAULT_CONTRACT
+from prismpipe.organic.computation.runtime.base import Runtime
 
 
 class PythonRuntime(Runtime):

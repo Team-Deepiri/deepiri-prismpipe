@@ -1,15 +1,15 @@
 """Partial package exports."""
 
-from prismpipe.revolutionary.partial.core import (
+from prismpipe.organic.partial.core import (
     PartialResult,
     ConfidenceLevel,
     PartialKnowledgeEngine,
     BackgroundTask,
     TaskStatus,
 )
-from prismpipe.revolutionary.partial.estimators import HeuristicConfidenceEstimator
-from prismpipe.revolutionary.partial.continuators import BackgroundContinuator
-from prismpipe.revolutionary.partial.aggregators import ResultCombiner
+from prismpipe.organic.partial.estimators import HeuristicConfidenceEstimator
+from prismpipe.organic.partial.continuators import BackgroundContinuator
+from prismpipe.organic.partial.aggregators import ResultCombiner
 
 __all__ = [
     "PartialResult",

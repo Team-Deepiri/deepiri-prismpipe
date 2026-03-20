@@ -1,6 +1,6 @@
 """Collect reducer for aggregating swarm results."""
 
-from prismpipe.revolutionary.swarm.core.result import SwarmResult
+from prismpipe.organic.swarm.core.result import SwarmResult
 
 
 class CollectReducer:

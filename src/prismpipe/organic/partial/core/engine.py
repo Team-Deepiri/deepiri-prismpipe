@@ -1,6 +1,6 @@
 """Partial knowledge engine."""
 
-from prismpipe.revolutionary.partial.core.partial_result import PartialResult, ConfidenceLevel
+from prismpipe.organic.partial.core.partial_result import PartialResult, ConfidenceLevel
 
 
 class PartialKnowledgeEngine:

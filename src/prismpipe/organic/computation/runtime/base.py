@@ -3,8 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from prismpipe.revolutionary.computation.core.payload import ComputationPayload, ExecutionContext
-from prismpipe.revolutionary.computation.core.result import ExecutionResult
+from prismpipe.organic.computation.core.payload import ComputationPayload, ExecutionContext
+from prismpipe.organic.computation.core.result import ExecutionResult
 
 
 class Runtime(ABC):

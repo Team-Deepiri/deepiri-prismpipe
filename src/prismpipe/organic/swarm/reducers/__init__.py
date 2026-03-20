@@ -1,5 +1,5 @@
 """Swarm reducers exports."""
 
-from prismpipe.revolutionary.swarm.reducers.collect import CollectReducer
+from prismpipe.organic.swarm.reducers.collect import CollectReducer
 
 __all__ = ["CollectReducer"]

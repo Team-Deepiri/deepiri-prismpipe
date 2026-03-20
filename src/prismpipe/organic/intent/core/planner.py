@@ -4,8 +4,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any
 
-from prismpipe.revolutionary.intent.core.intent import Intent, IntentType
-from prismpipe.revolutionary.intent.core.path import CapabilityPath
+from prismpipe.organic.intent.core.intent import Intent, IntentType
+from prismpipe.organic.intent.core.path import CapabilityPath
 
 
 class PathPlanner(ABC):

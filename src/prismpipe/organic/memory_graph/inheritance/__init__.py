@@ -1,5 +1,5 @@
 """Memory graph inheritance exports."""
 
-from prismpipe.revolutionary.memory_graph.inheritance.selector import InheritanceSelector
+from prismpipe.organic.memory_graph.inheritance.selector import InheritanceSelector
 
 __all__ = ["InheritanceSelector"]

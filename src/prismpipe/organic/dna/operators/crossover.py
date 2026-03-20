@@ -1,7 +1,7 @@
 """Crossover operator for genetic algorithm."""
 
 import random
-from prismpipe.revolutionary.dna.core.genome import PipelineGenome
+from prismpipe.organic.dna.core.genome import PipelineGenome
 
 
 class CrossoverOperator:

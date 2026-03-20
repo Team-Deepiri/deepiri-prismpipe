@@ -1,5 +1,5 @@
 """DNA evaluators exports."""
 
-from prismpipe.revolutionary.dna.evaluators.fitness import FitnessEvaluator
+from prismpipe.organic.dna.evaluators.fitness import FitnessEvaluator
 
 __all__ = ["FitnessEvaluator"]

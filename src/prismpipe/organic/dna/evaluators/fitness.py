@@ -1,6 +1,6 @@
 """Fitness evaluator for genetic algorithm."""
 
-from prismpipe.revolutionary.dna.core.genome import PipelineGenome
+from prismpipe.organic.dna.core.genome import PipelineGenome
 
 
 class FitnessEvaluator:

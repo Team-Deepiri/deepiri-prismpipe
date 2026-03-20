@@ -379,7 +379,7 @@ src/prismpipe/
 ├── core/                  # DONE
 ├── engine/                # DONE + ORGANIC PIPE
 ├── sdk/                   # DONE
-├── revolutionary/
+├── organic/
 │   ├── computation/       # DONE
 │   ├── intent/            # DONE + IntentPlanner in engine
 │   ├── partial/           # DONE

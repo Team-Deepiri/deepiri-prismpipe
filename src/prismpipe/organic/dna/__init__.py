@@ -1,9 +1,9 @@
 """DNA package exports."""
 
-from prismpipe.revolutionary.dna.core import PipelineGenome, Population
-from prismpipe.revolutionary.dna.operators import MutationOperator, CrossoverOperator
-from prismpipe.revolutionary.dna.selectors import TournamentSelector
-from prismpipe.revolutionary.dna.evaluators import FitnessEvaluator
+from prismpipe.organic.dna.core import PipelineGenome, Population
+from prismpipe.organic.dna.operators import MutationOperator, CrossoverOperator
+from prismpipe.organic.dna.selectors import TournamentSelector
+from prismpipe.organic.dna.evaluators import FitnessEvaluator
 
 __all__ = [
     "PipelineGenome",
