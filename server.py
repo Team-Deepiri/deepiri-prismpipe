@@ -9,8 +9,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import uvicorn
 import os
+import time
+import signal
 
 PORT = int(os.getenv("PORT", "5011"))
+START_TIME = time.monotonic()
+_shutting_down = False
 
 from prismpipe import PrismEngine, create_envelope
 from prismpipe.core import Intent, Node, NodeResult
@@ -199,8 +203,41 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "engine": "operational"}
+    return {
+        "status": "healthy",
+        "version": "0.2.0",
+        "timestamp": time.time(),
+        "uptime_seconds": round(time.monotonic() - START_TIME, 2),
+    }
 
+@app.get("/ready")
+async def ready():
+    try:
+        node_count = len(engine.router.list_capabilities())
+        if node_count == 0:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "reason": "No nodes registered",
+                    "timestamp": time.time(),
+                }
+            )
+
+        return {
+            "status": "ready",
+            "engine_nodes": node_count,
+            "timestamp": time.time(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": str(e),
+                "timestamp": time.time(),
+            }
+        )
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def handle_request(request: Request, path: str):
@@ -370,5 +407,35 @@ async def demo_intent_routing(intent: str):
     }
 
 
+async def shutdown(sig: signal.Signals, server: uvicorn.Server) -> None:
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    print(f"Received {sig.name}, shutting down gracefully...")
+    server.handle_exit(sig, None)
+
+def main() -> None:
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(PORT))
+    server = uvicorn.Server(config)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(shutdown(s, server))
+            )
+        except NotImplementedError:
+            # Windows does not support add_signal_handler
+            pass
+
+    try:
+        loop.run_until_complete(server.serve())
+    finally:
+        loop.close()
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(PORT))
+    main()
