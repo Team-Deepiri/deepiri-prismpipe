@@ -7,15 +7,10 @@ Run with: uvicorn server:app --reload --port 5011
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
-import uvicorn
 import os
 import time
-import signal
 
-PORT = int(os.getenv("PORT", "5011"))
-HOST = os.getenv("HOST", "0.0.0.0")
 START_TIME = time.monotonic()
-_shutting_down = False
 
 from prismpipe import PrismEngine, create_envelope
 from prismpipe.core import Intent, Node, NodeResult
@@ -407,36 +402,3 @@ async def demo_intent_routing(intent: str):
         "success": not result.terminated,
     }
 
-
-async def shutdown(sig: signal.Signals, server: uvicorn.Server) -> None:
-    global _shutting_down
-    if _shutting_down:
-        return
-    _shutting_down = True
-    print(f"Received {sig.name}, shutting down gracefully...")
-    server.handle_exit(sig, None)
-
-def main() -> None:
-    config = uvicorn.Config(app, host=HOST, port=PORT)
-    server = uvicorn.Server(config)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(shutdown(s, server))
-            )
-        except NotImplementedError:
-            # Windows does not support add_signal_handler
-            pass
-
-    try:
-        loop.run_until_complete(server.serve())
-    finally:
-        loop.close()
-
-if __name__ == "__main__":
-    main()

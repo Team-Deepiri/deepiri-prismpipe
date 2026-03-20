@@ -247,6 +247,8 @@
 - [ ] **Ryan** - Organic pipe persistence backend
 - [ ] **Julie** - Cross-node organism registry
 
+- Infrastructure note: PrismPipe runs under Gunicorn with `uvicorn.workers.UvicornWorker` for worker supervision (auto-restart on worker failure) and multi-core scaling via `WEB_CONCURRENCY`.
+
 ---
 
 ## ASSIGNMENTS SUMMARY
