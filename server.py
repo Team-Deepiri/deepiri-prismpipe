@@ -7,11 +7,9 @@ Run with: uvicorn server:app --reload --port 5011
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
-import uvicorn
 import os
 import time
 
-PORT = int(os.getenv("PORT", "5011"))
 START_TIME = time.monotonic()
 
 from prismpipe import PrismEngine, create_envelope
@@ -404,6 +402,3 @@ async def demo_intent_routing(intent: str):
         "success": not result.terminated,
     }
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(PORT))

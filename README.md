@@ -255,14 +255,14 @@ similar = registry.find_similar(organism, max_results=10)
 
 ```
                     ┌─────────────────────────────────────┐
-                    │           PrismEngine                │
+                    │             PrismEngine             │
                     └─────────────────────────────────────┘
                                       │
         ┌─────────────────────────────┼─────────────────────────────┐
         │                             │                             │
         ▼                             ▼                             ▼
 ┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
-│  Organism     │          │ ComputationGraph │          │  IntentPlanner │
+│  Organism     │          │ ComputationGraph│          │  IntentPlanner  │
 │  Registry     │◄─────────│ (Deduplication) │─────────►│ (NLP → Pipeline)│
 └───────────────┘          └─────────────────┘          └─────────────────┘
         │                             │                             │
@@ -275,7 +275,7 @@ similar = registry.find_similar(organism, max_results=10)
         ▼                             ▼                             ▼
 ┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
 │  Knowledge    │          │ SwarmCoordinator│          │  GravityEngine  │
-│  Inheritance  │          │ (MapReduce)     │          │ (Data Locality)│
+│  Inheritance  │          │ (MapReduce)     │          │ (Data Locality) │
 └───────────────┘          └─────────────────┘          └─────────────────┘
 ```
 
@@ -338,7 +338,7 @@ child = organism.spawn_child(patch_input={"filter": "active"})
 
 ---
 
-#** Our goal is basically just to optimize the lifecycle of requests.**
+ **Our goal is basically just to optimize the lifecycle of requests.**
 
 
 ---
