@@ -41,8 +41,11 @@ async def add_request_id(request: Request, call_next):
         response.headers.setdefault("X-Request-ID", request_id)
         return response
     finally:
-        duration = time.monotonic() - start
-        print(f"[{request_id}] {request.method} {request.url.path} {status_code} {duration:.3f}s")
+        try:
+            duration = time.monotonic() - start
+            print(f"[{request_id}] {request.method} {request.url.path} {status_code} {duration:.3f}s")
+        except Exception:
+            pass
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
