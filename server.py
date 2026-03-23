@@ -6,6 +6,7 @@ Run with: uvicorn server:app --reload --port 5011
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from uuid import uuid4
 import asyncio
 import os
 import time
@@ -26,6 +27,46 @@ app = FastAPI(
 # Create the engine
 engine = PrismEngine()
 
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    incoming_id = request.headers.get("X-Request-ID")
+    request_id = incoming_id if incoming_id and len(incoming_id) < 100 else str(uuid4())
+    request.state.request_id = request_id
+
+    start = time.monotonic()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers.setdefault("X-Request-ID", request_id)
+        return response
+    finally:
+        try:
+            duration = time.monotonic() - start
+            print(f"[{request_id}] {request.method} {request.url.path} {status_code} {duration:.3f}s")
+        except Exception:
+            pass
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", str(uuid4()))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error",
+            "request_id": request_id,
+        },
+        headers={"X-Request-ID": request_id},
+    )
+
+@app.exception_handler(asyncio.CancelledError)
+async def cancelled_handler(request: Request, exc: asyncio.CancelledError):
+    request_id = getattr(request.state, "request_id", str(uuid4()))
+    return JSONResponse(
+        status_code=499,
+        content={"detail": "Request cancelled", "request_id": request_id},
+        headers={"X-Request-ID": request_id},
+    )             
 
 # =============================================================================
 # EXAMPLE NODES - Connect to your services
