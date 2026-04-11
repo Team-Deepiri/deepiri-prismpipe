@@ -286,10 +286,35 @@ similar = registry.find_similar(organism, max_results=10)
 ```bash
 git clone git@github.com:Team-Deepiri/deepiri-prismpipe.git
 cd deepiri-prismpipe
-pip install -e .
+uv sync --extra server
 
-# Run the organic demo
-PYTHONPATH=./src python3 -m examples.organic_demo
+# Run the current proof-of-concept API server
+uv run uvicorn server:app --reload --port 5011
+
+# Run the test suite
+uv run pytest
+```
+
+### Current Proof Of Concept
+
+The repository currently includes a FastAPI proof of concept in `server.py` that demonstrates:
+
+- a capability-routed request pipeline
+- request memory, snapshots, diffs, and semantic cache inspection endpoints
+- demo routes for users, models, analytics, streaming, and intent routing
+
+Once the server is running, you can try:
+
+```bash
+curl http://127.0.0.1:5011/health
+curl http://127.0.0.1:5011/engine/capabilities
+curl http://127.0.0.1:5011/engine/memory
+curl http://127.0.0.1:5011/engine/cache
+
+# Authenticated demo routes
+curl -H "Authorization: Bearer test" http://127.0.0.1:5011/users
+curl -H "Authorization: Bearer test" http://127.0.0.1:5011/models
+curl -H "Authorization: Bearer test" http://127.0.0.1:5011/analytics
 ```
 
 ---

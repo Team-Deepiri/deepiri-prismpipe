@@ -40,6 +40,13 @@ async def add_request_id(request: Request, call_next):
         status_code = response.status_code
         response.headers.setdefault("X-Request-ID", request_id)
         return response
+    except asyncio.CancelledError:
+        status_code = 499
+        return JSONResponse(
+            status_code=499,
+            content={"detail": "Request cancelled", "request_id": request_id},
+            headers={"X-Request-ID": request_id},
+        )
     finally:
         try:
             duration = time.monotonic() - start
@@ -58,15 +65,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         },
         headers={"X-Request-ID": request_id},
     )
-
-@app.exception_handler(asyncio.CancelledError)
-async def cancelled_handler(request: Request, exc: asyncio.CancelledError):
-    request_id = getattr(request.state, "request_id", str(uuid4()))
-    return JSONResponse(
-        status_code=499,
-        content={"detail": "Request cancelled", "request_id": request_id},
-        headers={"X-Request-ID": request_id},
-    )             
 
 # =============================================================================
 # EXAMPLE NODES - Connect to your services
@@ -276,43 +274,6 @@ async def ready():
             }
         )
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def handle_request(request: Request, path: str):
-    """Main request handler - converts HTTP to envelope, processes, returns."""
-    
-    try:
-        body = await request.body()
-        if body:
-            import orjson
-            body = orjson.loads(body)
-        else:
-            body = None
-    except Exception:
-        body = None
-    
-    envelope = create_envelope(
-        intent=Intent.HTTP_REQUEST,
-        input_data={
-            "method": request.method,
-            "path": f"/{path}",
-            "query_params": dict(request.query_params),
-            "headers": dict(request.headers),
-            "body": body,
-        },
-        next_capability="auth.validate",
-    )
-    
-    result = await engine.execute(envelope)
-    
-    response_data = result.state.get("http_response", {})
-    
-    return JSONResponse(
-        status_code=response_data.get("status_code", 200),
-        content=response_data.get("body", {"ok": True}),
-        headers=response_data.get("headers", {}),
-    )
-
-
 # =============================================================================
 # ENGINE API - Inspect and control the engine
 # =============================================================================
@@ -443,3 +404,43 @@ async def demo_intent_routing(intent: str):
         "success": not result.terminated,
     }
 
+
+# =============================================================================
+# CATCH-ALL API PIPELINE
+# =============================================================================
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def handle_request(request: Request, path: str):
+    """Main request handler - converts HTTP to envelope, processes, returns."""
+
+    try:
+        body = await request.body()
+        if body:
+            import orjson
+            body = orjson.loads(body)
+        else:
+            body = None
+    except Exception:
+        body = None
+
+    envelope = create_envelope(
+        intent=Intent.HTTP_REQUEST,
+        input_data={
+            "method": request.method,
+            "path": f"/{path}",
+            "query_params": dict(request.query_params),
+            "headers": dict(request.headers),
+            "body": body,
+        },
+        next_capability="auth.validate",
+    )
+
+    result = await engine.execute(envelope)
+
+    response_data = result.state.get("http_response", {})
+
+    return JSONResponse(
+        status_code=response_data.get("status_code", 200),
+        content=response_data.get("body", {"ok": True}),
+        headers=response_data.get("headers", {}),
+    )

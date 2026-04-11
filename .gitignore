@@ -117,6 +117,7 @@ env.bak/
 venv.bak/
 
 # IDEs
+.codex
 .vscode/
 .idea/
 .spyderproject
