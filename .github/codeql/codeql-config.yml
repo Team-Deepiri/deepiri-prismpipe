@@ -3,7 +3,6 @@ name: deepiri-prismpipe-codeql-config
 # Focus analysis on maintained source code for this service.
 paths:
   - src
-  - server.py
   - tests
 
 # Exclude generated/build/cache artifacts.
