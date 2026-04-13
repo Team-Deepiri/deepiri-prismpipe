@@ -1,0 +1,17 @@
+name: deepiri-prismpipe-codeql-config
+
+# Focus analysis on maintained source code for this service.
+paths:
+  - src
+  - tests
+
+# Exclude generated/build/cache artifacts.
+paths-ignore:
+  - '**/__pycache__/**'
+  - '**/.pytest_cache/**'
+  - '**/.mypy_cache/**'
+  - '**/.venv/**'
+  - '**/venv/**'
+  - '**/dist/**'
+  - '**/build/**'
+  - '**/*.min.js'
