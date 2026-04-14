@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -e ".[all]"
 COPY server.py .
 
 # Expose port
-EXPOSE 5011
+EXPOSE 8000
 
 # Run server
 ENV WEB_CONCURRENCY=4
