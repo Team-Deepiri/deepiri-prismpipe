@@ -26,7 +26,7 @@ pytest-cov = "^5.0.0"
 ruff = "^0.6.0"
 mypy = "^1.11.0"
 pre-commit = "^4.0.0"
-black = "^24.0.0"
+black = ">=24,<27"
 
 [tool.poetry.urls]
 Homepage = "https://github.com/Team-Deepiri/deepiri-prismpipe"
