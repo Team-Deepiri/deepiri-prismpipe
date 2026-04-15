@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prismpipe
+  labels:
+    app.kubernetes.io/name: prismpipe
+    app.kubernetes.io/part-of: deepiri
