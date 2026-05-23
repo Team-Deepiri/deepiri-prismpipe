@@ -12,7 +12,7 @@
 
 - SDK decorators (@node, @enrich, @transform, @validate)
 
-- FastAPI server on port 5011
+- FastAPI server on port 8000
 
 
 #### ORGANIC PIPE SYSTEM (NEW - 16 FEATURES)
@@ -107,7 +107,7 @@
 - RequestEnvelope, CapabilityRouter, Pipeline
 - 10 Engine features (Replay, Diff, Graph, Remote, Stream, Parallel, Cost, Cache, Ancestry, Memory)
 - SDK decorators (@node, @enrich, @transform, @validate)
-- FastAPI server on port 5011
+- FastAPI server on port 8000
 
 #### ORGANIC PIPE SYSTEM (NEW - 16 FEATURES)
 
