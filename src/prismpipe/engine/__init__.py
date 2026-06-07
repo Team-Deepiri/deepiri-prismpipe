@@ -299,6 +299,7 @@ class Organism:
             child._plan.add(initial_capability)
         
         child.state = dict(self.state)
+        child.metadata = self.metadata.model_copy(deep=True)
         
         for atom in self.knowledge:
             if atom.confidence > 0.5:
