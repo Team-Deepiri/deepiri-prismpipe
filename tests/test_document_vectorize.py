@@ -55,6 +55,49 @@ class FailingVectorizer:
         raise RuntimeError("embedding backend unavailable")
 
 
+class InvalidDimensionsVectorizer:
+    provider = "invalid-dimensions-provider"
+    model = "invalid-dimensions-model"
+
+    def __init__(self, dimensions: Any) -> None:
+        self.dimensions = dimensions
+
+    def vectorize(self, request: DocumentVectorizeInput) -> VectorizeBackendResult:
+        return VectorizeBackendResult(
+            chunks=[
+                VectorizedChunk(
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                    vector=[float(index + 1), float(len(chunk.text))],
+                )
+                for index, chunk in enumerate(request.chunks)
+            ],
+            dimensions=self.dimensions,
+        )
+
+
+class SwappedChunkVectorizer:
+    provider = "swapped-chunk-provider"
+    model = "swapped-chunk-model"
+
+    def vectorize(self, request: DocumentVectorizeInput) -> VectorizeBackendResult:
+        return VectorizeBackendResult(
+            chunks=[
+                VectorizedChunk(
+                    chunk_id=request.chunks[1].chunk_id,
+                    text=request.chunks[0].text,
+                    vector=[1.0, 10.0],
+                ),
+                VectorizedChunk(
+                    chunk_id=request.chunks[0].chunk_id,
+                    text=request.chunks[1].text,
+                    vector=[2.0, 9.0],
+                ),
+            ],
+            dimensions=2,
+        )
+
+
 class TrackingPrismEngine(PrismEngine):
     def __init__(self) -> None:
         super().__init__()
@@ -173,6 +216,7 @@ async def test_invalid_payload_fails_cleanly_without_backend_call():
         engine,
         {"documentId": "doc_bad", "chunks": []},
         vectorizer,
+        parent_state={"document_vectorize": {"documentId": "stale_doc"}},
     )
 
     assert len(engine.child_calls) == 1
@@ -180,6 +224,7 @@ async def test_invalid_payload_fails_cleanly_without_backend_call():
     assert result.success is False
     assert result.child.terminated is True
     assert result.output is None
+    assert "document_vectorize" not in result.child.state
 
     error = result.error
     assert error is not None
@@ -203,6 +248,37 @@ async def test_bool_dimensions_are_rejected_without_backend_call():
     assert result.error is not None
     assert result.error["code"] == "VALIDATION_ERROR"
     assert result.error["message"] == "options.dimensions must be a positive integer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_dimensions", [True, 2.0])
+async def test_invalid_backend_dimensions_are_rejected(backend_dimensions):
+    engine = PrismEngine()
+    vectorizer = InvalidDimensionsVectorizer(backend_dimensions)
+    payload = canonical_payload()
+    payload["options"].pop("dimensions")
+
+    result = await execute_document_vectorize(engine, payload, vectorizer)
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["details"]["error"] == "Vectorizer returned invalid vector dimensions"
+
+
+@pytest.mark.asyncio
+async def test_swapped_backend_chunk_ids_are_rejected():
+    engine = PrismEngine()
+    vectorizer = SwappedChunkVectorizer()
+
+    result = await execute_document_vectorize(engine, canonical_payload(), vectorizer)
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["details"]["error"] == "Vectorizer returned mismatched chunk id for chunks[0]"
 
 
 @pytest.mark.asyncio

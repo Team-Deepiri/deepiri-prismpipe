@@ -357,6 +357,7 @@ async def execute_document_vectorize(
 
 
 def _fail_envelope(envelope, error: DocumentVectorizeError) -> NodeResult:
+    envelope.state.pop("document_vectorize", None)
     envelope.state["document_vectorize_error"] = error.to_payload()
     envelope.set_next(None)
     envelope.terminate(error.message)
@@ -378,7 +379,13 @@ def _validate_backend_result(
         raise ValueError("Vectorizer returned a different number of chunks")
 
     dimensions = result.dimensions
+    if dimensions is not None:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
+            raise ValueError("Vectorizer returned invalid vector dimensions")
+
     for index, chunk in enumerate(result.chunks):
+        if chunk.chunk_id != request.chunks[index].chunk_id:
+            raise ValueError(f"Vectorizer returned mismatched chunk id for chunks[{index}]")
         if not isinstance(chunk.vector, list) or not chunk.vector:
             raise ValueError(f"Vectorizer returned an empty vector for chunks[{index}]")
         if not all(
