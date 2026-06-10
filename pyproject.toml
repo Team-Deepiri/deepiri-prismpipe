@@ -21,7 +21,7 @@ dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy", "pre-commit", "
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.3"
-pytest-asyncio = "^0.25.0"
+pytest-asyncio = "^1.4.0"
 pytest-cov = "^5.0.0"
 ruff = "^0.6.0"
 mypy = "^1.11.0"
