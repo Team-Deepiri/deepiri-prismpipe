@@ -10,7 +10,7 @@ from prismpipe.core import Intent, Node, NodeResult, create_envelope
 from prismpipe.engine import Organism, PrismEngine
 
 DOCUMENT_VECTORIZE_CAPABILITY = "document.vectorize"
-DOCUMENT_VECTORIZE_INPUT_KEY = "document_vectorize"
+DOCUMENT_VECTORIZE_INPUT_KEY = "document_vectorize"  # envelope.input slot for the vectorize payload
 
 
 class DocumentVectorizeValidationError(ValueError):
@@ -45,7 +45,7 @@ class VectorizeOptions:
     """Execution options for document.vectorize."""
 
     dimensions: int | None = None
-    normalize: bool = False
+    normalize: bool = False  # backend hint; runtime does not enforce until a vectorizer applies it
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -328,12 +328,13 @@ async def execute_document_vectorize(
 
     engine.register_node(DocumentVectorizeNode(vectorizer))
 
-    envelope_input: dict[str, Any] = {
-        "event": DOCUMENT_VECTORIZE_CAPABILITY,
-        DOCUMENT_VECTORIZE_INPUT_KEY: payload,
-    }
-    if parent_input:
-        envelope_input.update(dict(parent_input))
+    envelope_input: dict[str, Any] = dict(parent_input) if parent_input else {}
+    envelope_input.update(
+        {
+            "event": DOCUMENT_VECTORIZE_CAPABILITY,
+            DOCUMENT_VECTORIZE_INPUT_KEY: payload,
+        }
+    )
 
     metadata_kwargs = dict(parent_metadata or {})
     envelope = create_envelope(

@@ -8,6 +8,7 @@ import pytest
 
 from prismpipe.document import (
     DOCUMENT_VECTORIZE_CAPABILITY,
+    DOCUMENT_VECTORIZE_INPUT_KEY,
     DocumentVectorizeInput,
     VectorizeBackendResult,
     VectorizedChunk,
@@ -137,6 +138,30 @@ async def test_valid_payload_routes_through_child_document_vectorize_capability(
             "metadata": {"sourceChunk": {"page": 2}},
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_parent_input_cannot_override_document_vectorize_payload():
+    engine = TrackingPrismEngine()
+    vectorizer = DeterministicVectorizer()
+    payload = canonical_payload()
+
+    result = await execute_document_vectorize(
+        engine,
+        payload,
+        vectorizer,
+        parent_input={
+            "path": "/documents/vectorize",
+            DOCUMENT_VECTORIZE_INPUT_KEY: {"documentId": "doc_shadow", "chunks": []},
+            "event": "other.event",
+        },
+    )
+
+    assert result.success is True
+    assert vectorizer.calls[0].document_id == "doc_123"
+    assert result.parent.input["path"] == "/documents/vectorize"
+    assert result.parent.input["event"] == DOCUMENT_VECTORIZE_CAPABILITY
+    assert result.parent.input[DOCUMENT_VECTORIZE_INPUT_KEY] == payload
 
 
 @pytest.mark.asyncio
