@@ -1,0 +1,9 @@
+apiVersion: v2
+name: prismpipe
+description: Capability-Routed API Pipeline
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+maintainers:
+  - name: Deepiri Team
+    email: team@deepiri.ai

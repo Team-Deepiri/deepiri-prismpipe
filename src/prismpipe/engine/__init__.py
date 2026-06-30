@@ -275,9 +275,15 @@ class Organism:
         self,
         intent: Intent | str | None = None,
         patch_input: dict[str, Any] | None = None,
+        initial_capability: str | None = None,
     ) -> "Organism":
         child_intent = intent or self.intent
         child_input = dict(self.input)
+        child_initial_capability = (
+            initial_capability
+            if initial_capability is not None
+            else self._next_capability
+        )
         
         if patch_input:
             child_input.update(patch_input)
@@ -285,11 +291,15 @@ class Organism:
         child = Organism(
             intent=child_intent,
             input_data=child_input,
-            initial_capability=self._next_capability,
+            initial_capability=child_initial_capability,
             parent_organism_id=self.id,
         )
         
+        if initial_capability:
+            child._plan.add(initial_capability)
+        
         child.state = dict(self.state)
+        child.metadata = self.metadata.model_copy(deep=True)
         
         for atom in self.knowledge:
             if atom.confidence > 0.5:
@@ -976,22 +986,30 @@ class OrganismExecutor:
                     organism.history = list(envelope.history)
                     
                     latency = (time.perf_counter() - start_time) * 1000
+                    success = result.success and not envelope.terminated
                     
                     computation_graph.register_computation(
                         capability=capability,
                         input_data=organism.input,
                         output_data=organism.state,
                         latency_ms=latency,
-                        success=True,
+                        success=success,
                     )
+                    
+                    if not success:
+                        organism._next_capability = None
+                        organism.terminate(result.error or envelope.error)
+                        break
                 except Exception as e:
+                    organism._next_capability = None
                     organism.terminate(str(e))
                     break
             
             # Sync next capability from envelope
             organism._next_capability = envelope.next
         
-        organism._state = OrganismState.LEARNING
+        if not organism.terminated:
+            organism._state = OrganismState.LEARNING
         return organism
 
 
@@ -1603,6 +1621,21 @@ class PrismEngine:
         self.organism_registry.register(organism)
         return organism
 
+    def spawn_organism_from_envelope(
+        self,
+        envelope: RequestEnvelope,
+        initial_capability: str | None = None,
+    ) -> Organism:
+        organism = Organism.from_envelope(envelope)
+        
+        if initial_capability is not None:
+            organism.set_next(initial_capability)
+            if initial_capability not in organism._plan.capabilities:
+                organism._plan.add(initial_capability)
+        
+        self.organism_registry.register(organism)
+        return organism
+
     async def execute_organism(
         self,
         organism: Organism,
@@ -1610,6 +1643,29 @@ class PrismEngine:
     ) -> Organism:
         computation = self.computation_graph if use_computation_sharing else ComputationGraph()
         return await self.organism_executor.execute(organism, computation)
+
+    async def execute_child_organism(
+        self,
+        parent: Organism,
+        capability: str,
+        patch_input: dict[str, Any] | None = None,
+        intent: Intent | str | None = None,
+        use_computation_sharing: bool = False,
+    ) -> Organism:
+        if self.organism_registry.get(parent.id) is None:
+            self.organism_registry.register(parent)
+        
+        child = parent.spawn_child(
+            intent=intent,
+            patch_input=patch_input,
+            initial_capability=capability,
+        )
+        self.organism_registry.register(child)
+        
+        return await self.execute_organism(
+            child,
+            use_computation_sharing=use_computation_sharing,
+        )
 
     async def execute_organism_time_split(
         self,

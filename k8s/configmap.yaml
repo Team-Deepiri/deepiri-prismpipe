@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prismpipe-config
+  namespace: prismpipe
+  labels:
+    app.kubernetes.io/name: prismpipe
+data:
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  WEB_CONCURRENCY: "4"
