@@ -14,6 +14,7 @@ from prismpipe.document import (
     VectorizedChunk,
     execute_document_vectorize,
 )
+from prismpipe.document.vectorize import DocumentVectorizeValidationError
 from prismpipe.engine import PrismEngine
 
 
@@ -28,11 +29,13 @@ class DeterministicVectorizer:
         self.calls.append(request)
         chunks = []
         for index, chunk in enumerate(request.chunks):
+            text = chunk.text
+            assert text is not None
             chunks.append(
                 VectorizedChunk(
                     chunk_id=chunk.chunk_id,
-                    text=chunk.text,
-                    vector=[float(index + 1), float(len(chunk.text))],
+                    text=text,
+                    vector=[float(index + 1), float(len(text))],
                     metadata={"sourceChunk": chunk.metadata},
                 )
             )
@@ -67,8 +70,8 @@ class InvalidDimensionsVectorizer:
             chunks=[
                 VectorizedChunk(
                     chunk_id=chunk.chunk_id,
-                    text=chunk.text,
-                    vector=[float(index + 1), float(len(chunk.text))],
+                    text=chunk.text or "",
+                    vector=[float(index + 1), float(len(chunk.text or ""))],
                 )
                 for index, chunk in enumerate(request.chunks)
             ],
@@ -110,21 +113,27 @@ class TrackingPrismEngine(PrismEngine):
 
 def canonical_payload() -> dict[str, Any]:
     return {
-        "documentId": "doc_123",
+        "routeId": "route-001",
+        "documentId": "doc-001",
+        "manifestVersion": "1.0",
+        "destination": "vectorize",
+        "qualityScore": 0.95,
+        "correlationId": "corr-001",
+        "embeddingModel": "text-embedding-3-small",
+        "document": {
+            "documentId": "doc-001",
+            "title": "Test Document",
+            "mimeType": "text/plain",
+        },
         "chunks": [
             {
-                "chunkId": "chunk_a",
-                "text": "Alpha text",
-                "metadata": {"page": 1},
-            },
-            {
-                "chunkId": "chunk_b",
-                "text": "Beta text",
-                "metadata": {"page": 2},
+                "chunkId": "chunk-001",
+                "index": 0,
+                "text": "The mitochondria is the powerhouse of the cell.",
             },
         ],
-        "metadata": {"tenant": "tenant_a", "source": "unit-test"},
-        "options": {"dimensions": 2, "normalize": True},
+        "storageReferences": [],
+        "options": {"dimensions": None, "normalize": False, "metadata": {}},
     }
 
 
@@ -149,7 +158,9 @@ async def test_valid_payload_routes_through_child_document_vectorize_capability(
     assert result.success is True
     assert len(engine.child_calls) == 1
     assert engine.child_calls[0]["capability"] == DOCUMENT_VECTORIZE_CAPABILITY
-    assert vectorizer.calls[0].document_id == "doc_123"
+    assert vectorizer.calls[0].route_id == "route-001"
+    assert vectorizer.calls[0].document_id == "doc-001"
+    assert vectorizer.calls[0].document.document_id == "doc-001"
 
     assert result.child.envelope.parent_id == result.parent.id
     assert result.child.state["api_request_state"] == "received"
@@ -161,24 +172,21 @@ async def test_valid_payload_routes_through_child_document_vectorize_capability(
 
     output = result.output
     assert output is not None
-    assert output["documentId"] == "doc_123"
+    assert output["documentId"] == "doc-001"
     assert output["provider"] == "test-provider"
     assert output["model"] == "deterministic-v1"
     assert output["dimensions"] == 2
-    assert output["metadata"]["input"] == {"tenant": "tenant_a", "source": "unit-test"}
+    assert output["metadata"]["routeId"] == "route-001"
+    assert output["metadata"]["manifestVersion"] == "1.0"
+    assert output["metadata"]["correlationId"] == "corr-001"
+    assert output["metadata"]["embeddingModel"] == "text-embedding-3-small"
     assert output["metadata"]["backend"] == {"backend": "deterministic"}
     assert output["chunks"] == [
         {
-            "chunkId": "chunk_a",
-            "text": "Alpha text",
-            "vector": [1.0, 10.0],
-            "metadata": {"sourceChunk": {"page": 1}},
-        },
-        {
-            "chunkId": "chunk_b",
-            "text": "Beta text",
-            "vector": [2.0, 9.0],
-            "metadata": {"sourceChunk": {"page": 2}},
+            "chunkId": "chunk-001",
+            "text": "The mitochondria is the powerhouse of the cell.",
+            "vector": [1.0, 47.0],
+            "metadata": {"sourceChunk": {}},
         },
     ]
 
@@ -201,7 +209,7 @@ async def test_parent_input_cannot_override_document_vectorize_payload():
     )
 
     assert result.success is True
-    assert vectorizer.calls[0].document_id == "doc_123"
+    assert vectorizer.calls[0].document_id == "doc-001"
     assert result.parent.input["path"] == "/documents/vectorize"
     assert result.parent.input["event"] == DOCUMENT_VECTORIZE_CAPABILITY
     assert result.parent.input[DOCUMENT_VECTORIZE_INPUT_KEY] == payload
@@ -211,10 +219,12 @@ async def test_parent_input_cannot_override_document_vectorize_payload():
 async def test_invalid_payload_fails_cleanly_without_backend_call():
     engine = TrackingPrismEngine()
     vectorizer = DeterministicVectorizer()
+    payload = canonical_payload()
+    payload["chunks"] = []
 
     result = await execute_document_vectorize(
         engine,
-        {"documentId": "doc_bad", "chunks": []},
+        payload,
         vectorizer,
         parent_state={"document_vectorize": {"documentId": "stale_doc"}},
     )
@@ -232,6 +242,14 @@ async def test_invalid_payload_fails_cleanly_without_backend_call():
     assert error["message"] == "chunks must be a non-empty list"
     assert error["provider"] == "test-provider"
     assert error["model"] == "deterministic-v1"
+
+
+def test_missing_chunk_text_raises_document_vectorize_validation_error():
+    payload = canonical_payload()
+    payload["chunks"][0].pop("text")
+
+    with pytest.raises(DocumentVectorizeValidationError, match=r"chunks\[0\]\.text"):
+        DocumentVectorizeInput.from_payload(payload)
 
 
 @pytest.mark.asyncio
@@ -271,8 +289,16 @@ async def test_invalid_backend_dimensions_are_rejected(backend_dimensions):
 async def test_swapped_backend_chunk_ids_are_rejected():
     engine = PrismEngine()
     vectorizer = SwappedChunkVectorizer()
+    payload = canonical_payload()
+    payload["chunks"].append(
+        {
+            "chunkId": "chunk-002",
+            "index": 1,
+            "text": "Second chunk text.",
+        }
+    )
 
-    result = await execute_document_vectorize(engine, canonical_payload(), vectorizer)
+    result = await execute_document_vectorize(engine, payload, vectorizer)
 
     assert result.success is False
     assert result.output is None
@@ -298,7 +324,7 @@ async def test_backend_failure_terminates_child_and_records_context():
     assert error is not None
     assert error["code"] == "VECTORIZER_ERROR"
     assert error["message"] == "Vectorizer backend failed"
-    assert error["documentId"] == "doc_123"
+    assert error["documentId"] == "doc-001"
     assert error["provider"] == "broken-provider"
     assert error["model"] == "broken-model"
     assert error["details"] == {
@@ -326,4 +352,6 @@ async def test_output_shape_includes_required_vectorization_fields():
     }
     assert set(output["chunks"][0]) == {"chunkId", "text", "vector", "metadata"}
     assert isinstance(output["chunks"][0]["vector"], list)
+    assert output["metadata"]["correlationId"] == "corr-001"
+    assert output["metadata"]["manifestVersion"] == "1.0"
     assert output["dimensions"] == len(output["chunks"][0]["vector"])

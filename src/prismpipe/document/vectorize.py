@@ -18,24 +18,161 @@ class DocumentVectorizeValidationError(ValueError):
 
 
 @dataclass
-class DocumentChunk:
-    """A single document chunk to vectorize."""
+class StorageReference:
+    """LIS storage reference for document and chunk payloads."""
 
-    chunk_id: str
-    text: str
+    provider: str | None = None
+    bucket: str | None = None
+    key: str | None = None
+    uri: str | None = None
+    version_id: str | None = None
+    content_type: str | None = None
+    checksum: str | None = None
+    size_bytes: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any], index: int) -> "DocumentChunk":
-        chunk_id = _optional_string(payload, "chunkId") or f"chunk_{index + 1}"
-        text = _required_string(payload, "text", f"chunks[{index}].text")
-        metadata = _optional_mapping(payload, "metadata", f"chunks[{index}].metadata")
-        return cls(chunk_id=chunk_id, text=text, metadata=metadata)
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+        label: str = "storage",
+    ) -> "StorageReference":
+        if not isinstance(payload, Mapping):
+            raise DocumentVectorizeValidationError(f"{label} must be an object")
+
+        size_bytes = _optional_int(payload, "sizeBytes", f"{label}.sizeBytes")
+        if size_bytes is not None and size_bytes < 0:
+            raise DocumentVectorizeValidationError(
+                f"{label}.sizeBytes must be a non-negative integer"
+            )
+
+        return cls(
+            provider=_optional_string(payload, "provider", f"{label}.provider"),
+            bucket=_optional_string(payload, "bucket", f"{label}.bucket"),
+            key=_optional_string(payload, "key", f"{label}.key"),
+            uri=_optional_string(payload, "uri", f"{label}.uri"),
+            version_id=_optional_string(payload, "versionId", f"{label}.versionId"),
+            content_type=_optional_string(payload, "contentType", f"{label}.contentType"),
+            checksum=_optional_string(payload, "checksum", f"{label}.checksum"),
+            size_bytes=size_bytes,
+            metadata=_optional_mapping(payload, "metadata", f"{label}.metadata"),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "bucket": self.bucket,
+            "key": self.key,
+            "uri": self.uri,
+            "versionId": self.version_id,
+            "contentType": self.content_type,
+            "checksum": self.checksum,
+            "sizeBytes": self.size_bytes,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass
+class DocumentReference:
+    """LIS document reference embedded in a vectorize route payload."""
+
+    document_id: str
+    title: str | None = None
+    source_type: str | None = None
+    mime_type: str | None = None
+    fingerprint: str | None = None
+    storage: StorageReference | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "DocumentReference":
+        if not isinstance(payload, Mapping):
+            raise DocumentVectorizeValidationError("document must be an object")
+
+        raw_storage = payload.get("storage")
+        storage = None
+        if raw_storage is not None:
+            if not isinstance(raw_storage, Mapping):
+                raise DocumentVectorizeValidationError("document.storage must be an object")
+            storage = StorageReference.from_payload(raw_storage, "document.storage")
+
+        return cls(
+            document_id=_required_string(payload, "documentId", "document.documentId"),
+            title=_optional_string(payload, "title", "document.title"),
+            source_type=_optional_string(payload, "sourceType", "document.sourceType"),
+            mime_type=_optional_string(payload, "mimeType", "document.mimeType"),
+            fingerprint=_optional_string(payload, "fingerprint", "document.fingerprint"),
+            storage=storage,
+            metadata=_optional_mapping(payload, "metadata", "document.metadata"),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "documentId": self.document_id,
+            "title": self.title,
+            "sourceType": self.source_type,
+            "mimeType": self.mime_type,
+            "fingerprint": self.fingerprint,
+            "storage": self.storage.to_payload() if self.storage else None,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass
+class ChunkReference:
+    """LIS chunk reference for document.vectorize."""
+
+    chunk_id: str
+    index: int
+    text: str | None
+    document_id: str | None = None
+    token_count: int | None = None
+    storage: StorageReference | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], index: int) -> "ChunkReference":
+        chunk_label = f"chunks[{index}]"
+        if not isinstance(payload, Mapping):
+            raise DocumentVectorizeValidationError(f"{chunk_label} must be an object")
+
+        chunk_index = _required_int(payload, "index", f"{chunk_label}.index")
+        if chunk_index < 0:
+            raise DocumentVectorizeValidationError(
+                f"{chunk_label}.index must be a non-negative integer"
+            )
+
+        token_count = _optional_int(payload, "tokenCount", f"{chunk_label}.tokenCount")
+        if token_count is not None and token_count < 0:
+            raise DocumentVectorizeValidationError(
+                f"{chunk_label}.tokenCount must be a non-negative integer"
+            )
+
+        raw_storage = payload.get("storage")
+        storage = None
+        if raw_storage is not None:
+            if not isinstance(raw_storage, Mapping):
+                raise DocumentVectorizeValidationError(f"{chunk_label}.storage must be an object")
+            storage = StorageReference.from_payload(raw_storage, f"{chunk_label}.storage")
+
+        return cls(
+            chunk_id=_required_string(payload, "chunkId", f"{chunk_label}.chunkId"),
+            document_id=_optional_string(payload, "documentId", f"{chunk_label}.documentId"),
+            index=chunk_index,
+            text=_required_string(payload, "text", f"{chunk_label}.text"),
+            token_count=token_count,
+            storage=storage,
+            metadata=_optional_mapping(payload, "metadata", f"{chunk_label}.metadata"),
+        )
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "chunkId": self.chunk_id,
+            "documentId": self.document_id,
+            "index": self.index,
             "text": self.text,
+            "tokenCount": self.token_count,
+            "storage": self.storage.to_payload() if self.storage else None,
             "metadata": dict(self.metadata),
         }
 
@@ -79,10 +216,19 @@ class VectorizeOptions:
 
 @dataclass
 class DocumentVectorizeInput:
-    """Canonical document.vectorize input contract."""
+    """LIS VectorizeRoutePayload plus PrismPipe vectorize options."""
 
+    route_id: str
     document_id: str
-    chunks: list[DocumentChunk]
+    manifest_version: str | int
+    destination: str
+    quality_score: float
+    document: DocumentReference
+    chunks: list[ChunkReference]
+    storage_references: list[StorageReference] = field(default_factory=list)
+    correlation_id: str | None = None
+    embedding_model: str | None = None
+    classification: Any | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     options: VectorizeOptions = field(default_factory=VectorizeOptions)
 
@@ -91,30 +237,75 @@ class DocumentVectorizeInput:
         if not isinstance(payload, Mapping):
             raise DocumentVectorizeValidationError("document.vectorize payload must be an object")
 
+        route_id = _required_string(payload, "routeId", "routeId")
         document_id = _required_string(payload, "documentId", "documentId")
+        manifest_version = _required_manifest_version(payload, "manifestVersion")
+        destination = _required_string(payload, "destination", "destination")
+        if destination != "vectorize":
+            raise DocumentVectorizeValidationError("destination must be 'vectorize'")
+
+        quality_score = _required_number(payload, "qualityScore", "qualityScore")
+
+        raw_document = payload.get("document")
+        if not isinstance(raw_document, Mapping):
+            raise DocumentVectorizeValidationError("document must be an object")
+        document = DocumentReference.from_payload(raw_document)
+
         raw_chunks = payload.get("chunks")
         if not isinstance(raw_chunks, list) or not raw_chunks:
             raise DocumentVectorizeValidationError("chunks must be a non-empty list")
 
-        chunks: list[DocumentChunk] = []
+        chunks: list[ChunkReference] = []
         for index, raw_chunk in enumerate(raw_chunks):
             if not isinstance(raw_chunk, Mapping):
                 raise DocumentVectorizeValidationError(f"chunks[{index}] must be an object")
-            chunks.append(DocumentChunk.from_payload(raw_chunk, index))
+            chunks.append(ChunkReference.from_payload(raw_chunk, index))
+
+        raw_storage_references = payload.get("storageReferences", [])
+        if not isinstance(raw_storage_references, list):
+            raise DocumentVectorizeValidationError("storageReferences must be a list")
+
+        storage_references: list[StorageReference] = []
+        for index, raw_storage in enumerate(raw_storage_references):
+            if not isinstance(raw_storage, Mapping):
+                raise DocumentVectorizeValidationError(
+                    f"storageReferences[{index}] must be an object"
+                )
+            storage_references.append(
+                StorageReference.from_payload(raw_storage, f"storageReferences[{index}]")
+            )
 
         metadata = _optional_mapping(payload, "metadata", "metadata")
         options = VectorizeOptions.from_payload(payload.get("options"))
         return cls(
+            route_id=route_id,
             document_id=document_id,
+            manifest_version=manifest_version,
+            destination=destination,
+            quality_score=quality_score,
+            document=document,
             chunks=chunks,
+            storage_references=storage_references,
+            correlation_id=_optional_string(payload, "correlationId", "correlationId"),
+            embedding_model=_optional_string(payload, "embeddingModel", "embeddingModel"),
+            classification=payload.get("classification"),
             metadata=metadata,
             options=options,
         )
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            "routeId": self.route_id,
             "documentId": self.document_id,
+            "manifestVersion": self.manifest_version,
+            "destination": self.destination,
+            "qualityScore": self.quality_score,
+            "correlationId": self.correlation_id,
+            "embeddingModel": self.embedding_model,
+            "classification": self.classification,
+            "document": self.document.to_payload(),
             "chunks": [chunk.to_payload() for chunk in self.chunks],
+            "storageReferences": [reference.to_payload() for reference in self.storage_references],
             "metadata": dict(self.metadata),
             "options": self.options.to_payload(),
         }
@@ -179,7 +370,10 @@ class DocumentVectorizeOutput:
     ) -> "DocumentVectorizeOutput":
         dimensions = _validate_backend_result(request, result)
         metadata = {
-            "input": dict(request.metadata),
+            "routeId": request.route_id,
+            "manifestVersion": request.manifest_version,
+            "correlationId": request.correlation_id,
+            "embeddingModel": request.embedding_model,
             "backend": dict(result.metadata),
             "options": request.options.to_payload(),
         }
@@ -413,12 +607,44 @@ def _required_string(payload: Mapping[str, Any], key: str, label: str) -> str:
     return value
 
 
-def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+def _required_int(payload: Mapping[str, Any], key: str, label: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DocumentVectorizeValidationError(f"{label} must be an integer")
+    return value
+
+
+def _optional_int(payload: Mapping[str, Any], key: str, label: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DocumentVectorizeValidationError(f"{label} must be an integer")
+    return value
+
+
+def _required_manifest_version(payload: Mapping[str, Any], key: str) -> str | int:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    raise DocumentVectorizeValidationError(f"{key} must be a non-empty string or integer")
+
+
+def _required_number(payload: Mapping[str, Any], key: str, label: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise DocumentVectorizeValidationError(f"{label} must be a number")
+    return float(value)
+
+
+def _optional_string(payload: Mapping[str, Any], key: str, label: str | None = None) -> str | None:
     value = payload.get(key)
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise DocumentVectorizeValidationError(f"{key} must be a non-empty string")
+        raise DocumentVectorizeValidationError(f"{label or key} must be a non-empty string")
     return value
 
 
