@@ -116,6 +116,14 @@ def canonical_payload() -> dict[str, Any]:
         "routeId": "route-001",
         "documentId": "doc-001",
         "manifestVersion": "1.0",
+        "documentType": "lease",
+        "schemaId": "document.route.v1",
+        "schemaVersion": "1.0",
+        "provenance": {
+            "producer": "lis",
+            "routedAt": "2026-07-10T12:00:00.000Z",
+        },
+        "artifactRequests": [],
         "destination": "vectorize",
         "qualityScore": 0.95,
         "correlationId": "corr-001",
@@ -180,6 +188,9 @@ async def test_valid_payload_routes_through_child_document_vectorize_capability(
     assert output["metadata"]["manifestVersion"] == "1.0"
     assert output["metadata"]["correlationId"] == "corr-001"
     assert output["metadata"]["embeddingModel"] == "text-embedding-3-small"
+    assert output["metadata"]["documentType"] == "lease"
+    assert output["metadata"]["schemaId"] == "document.route.v1"
+    assert output["metadata"]["schemaVersion"] == "1.0"
     assert output["metadata"]["backend"] == {"backend": "deterministic"}
     assert output["chunks"] == [
         {
@@ -354,4 +365,206 @@ async def test_output_shape_includes_required_vectorization_fields():
     assert isinstance(output["chunks"][0]["vector"], list)
     assert output["metadata"]["correlationId"] == "corr-001"
     assert output["metadata"]["manifestVersion"] == "1.0"
+    assert output["metadata"]["provenance"] == canonical_payload()["provenance"]
     assert output["dimensions"] == len(output["chunks"][0]["vector"])
+
+
+def test_complete_canonical_payload_survives_round_trip():
+    payload = canonical_payload()
+    payload.update(
+        {
+            "classification": {"category": "legal"},
+            "metadata": {"routing": {"idempotencyKey": "route-001"}},
+            "provenance": {
+                "producer": "lis",
+                "routedAt": "2026-07-10T12:00:00.000Z",
+                "lineage": {"source": "document.ingested"},
+            },
+            "artifactRequests": [
+                {"artifactType": "embedding", "parameters": {"dimensions": 2}},
+                {"artifactType": "summary", "required": False},
+            ],
+            "options": {
+                "dimensions": 2,
+                "normalize": True,
+                "metadata": {"profile": "canonical"},
+            },
+        }
+    )
+    payload["document"].update(
+        {
+            "sourceType": "upload",
+            "fingerprint": "sha256-document",
+            "storage": {
+                "provider": "s3",
+                "bucket": "documents",
+                "key": "doc-001/source.pdf",
+                "uri": "s3://documents/doc-001/source.pdf",
+                "versionId": "v1",
+                "contentType": "application/pdf",
+                "checksum": "sha256-document",
+                "sizeBytes": 2048,
+                "metadata": {"region": "us-east-1"},
+            },
+            "metadata": {"language": "en"},
+        }
+    )
+    payload["chunks"] = [
+        {
+            "chunkId": "chunk-001",
+            "documentId": "doc-001",
+            "index": 0,
+            "text": "First complete chunk.",
+            "tokenCount": 3,
+            "storage": {
+                "provider": "s3",
+                "bucket": "documents",
+                "key": "doc-001/chunks/0.txt",
+                "uri": "s3://documents/doc-001/chunks/0.txt",
+                "versionId": "v1",
+                "contentType": "text/plain",
+                "checksum": "sha256-chunk-001",
+                "sizeBytes": 21,
+                "metadata": {"encoding": "utf-8"},
+            },
+            "metadata": {"page": 1},
+        },
+        {
+            "chunkId": "chunk-002",
+            "documentId": "doc-001",
+            "index": 1,
+            "text": "Second complete chunk.",
+            "tokenCount": 3,
+            "storage": {
+                "provider": "s3",
+                "bucket": "documents",
+                "key": "doc-001/chunks/1.txt",
+                "uri": "s3://documents/doc-001/chunks/1.txt",
+                "versionId": "v1",
+                "contentType": "text/plain",
+                "checksum": "sha256-chunk-002",
+                "sizeBytes": 22,
+                "metadata": {"encoding": "utf-8"},
+            },
+            "metadata": {"page": 2},
+        },
+    ]
+    payload["storageReferences"] = [
+        {
+            "provider": "s3",
+            "bucket": "documents",
+            "key": "doc-001/source.pdf",
+            "uri": "s3://documents/doc-001/source.pdf",
+            "versionId": "v1",
+            "contentType": "application/pdf",
+            "checksum": "sha256-document",
+            "sizeBytes": 2048,
+            "metadata": {"role": "source"},
+        },
+        {
+            "provider": "s3",
+            "bucket": "documents",
+            "key": "doc-001/manifest.json",
+            "uri": "s3://documents/doc-001/manifest.json",
+            "versionId": "v2",
+            "contentType": "application/json",
+            "checksum": "sha256-manifest",
+            "sizeBytes": 512,
+            "metadata": {"role": "manifest"},
+        },
+    ]
+
+    parsed = DocumentVectorizeInput.from_payload(payload)
+    serialized = parsed.to_payload()
+
+    for field_name in (
+        "routeId",
+        "documentId",
+        "manifestVersion",
+        "documentType",
+        "schemaId",
+        "schemaVersion",
+        "provenance",
+        "artifactRequests",
+        "destination",
+        "qualityScore",
+        "correlationId",
+        "embeddingModel",
+        "classification",
+        "metadata",
+        "document",
+        "chunks",
+        "storageReferences",
+        "options",
+    ):
+        assert serialized[field_name] == payload[field_name]
+
+
+@pytest.mark.asyncio
+async def test_raw_child_input_preserves_complete_original_payload():
+    engine = PrismEngine()
+    vectorizer = DeterministicVectorizer()
+    payload = canonical_payload()
+    payload["artifactRequests"] = [
+        {"artifactType": "embedding", "parameters": {"dimensions": 2}}
+    ]
+
+    result = await execute_document_vectorize(engine, payload, vectorizer)
+
+    assert result.success is True
+    assert result.child.input[DOCUMENT_VECTORIZE_INPUT_KEY] == payload
+    child_payload = result.child.input[DOCUMENT_VECTORIZE_INPUT_KEY]
+    assert child_payload["documentType"] == "lease"
+    assert child_payload["schemaId"] == "document.route.v1"
+    assert child_payload["schemaVersion"] == "1.0"
+    assert child_payload["provenance"] == payload["provenance"]
+    assert child_payload["artifactRequests"] == payload["artifactRequests"]
+
+
+def test_route_schema_fields_fall_back_to_nested_document():
+    payload = canonical_payload()
+    payload.pop("documentType")
+    payload.pop("schemaId")
+    payload.pop("schemaVersion")
+    payload["document"].update(
+        {
+            "documentType": "nested-lease",
+            "schemaId": "nested.document.route.v1",
+            "schemaVersion": "nested-1.0",
+        }
+    )
+
+    parsed = DocumentVectorizeInput.from_payload(payload)
+    serialized = parsed.to_payload()
+
+    assert parsed.document_type == "nested-lease"
+    assert parsed.schema_id == "nested.document.route.v1"
+    assert parsed.schema_version == "nested-1.0"
+    assert serialized["documentType"] == "nested-lease"
+    assert serialized["schemaId"] == "nested.document.route.v1"
+    assert serialized["schemaVersion"] == "nested-1.0"
+
+
+def test_root_route_schema_fields_take_precedence_over_nested_document():
+    payload = canonical_payload()
+    payload["document"].update(
+        {
+            "documentType": "nested-lease",
+            "schemaId": "nested.document.route.v1",
+            "schemaVersion": "nested-1.0",
+        }
+    )
+
+    parsed = DocumentVectorizeInput.from_payload(payload)
+
+    assert parsed.document_type == "lease"
+    assert parsed.schema_id == "document.route.v1"
+    assert parsed.schema_version == "1.0"
+
+
+def test_artifact_requests_must_be_a_list():
+    payload = canonical_payload()
+    payload["artifactRequests"] = {"artifactType": "embedding"}
+
+    with pytest.raises(DocumentVectorizeValidationError, match="artifactRequests must be a list"):
+        DocumentVectorizeInput.from_payload(payload)

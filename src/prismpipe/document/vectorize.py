@@ -226,6 +226,11 @@ class DocumentVectorizeInput:
     document: DocumentReference
     chunks: list[ChunkReference]
     storage_references: list[StorageReference] = field(default_factory=list)
+    document_type: str | None = None
+    schema_id: str | None = None
+    schema_version: str | None = None
+    provenance: dict[str, Any] = field(default_factory=dict)
+    artifact_requests: list[Any] = field(default_factory=list)
     correlation_id: str | None = None
     embedding_model: str | None = None
     classification: Any | None = None
@@ -275,6 +280,10 @@ class DocumentVectorizeInput:
                 StorageReference.from_payload(raw_storage, f"storageReferences[{index}]")
             )
 
+        raw_artifact_requests = payload.get("artifactRequests", [])
+        if not isinstance(raw_artifact_requests, list):
+            raise DocumentVectorizeValidationError("artifactRequests must be a list")
+
         metadata = _optional_mapping(payload, "metadata", "metadata")
         options = VectorizeOptions.from_payload(payload.get("options"))
         return cls(
@@ -286,6 +295,23 @@ class DocumentVectorizeInput:
             document=document,
             chunks=chunks,
             storage_references=storage_references,
+            document_type=_optional_root_or_document_string(
+                payload,
+                raw_document,
+                "documentType",
+            ),
+            schema_id=_optional_root_or_document_string(
+                payload,
+                raw_document,
+                "schemaId",
+            ),
+            schema_version=_optional_root_or_document_string(
+                payload,
+                raw_document,
+                "schemaVersion",
+            ),
+            provenance=_optional_mapping(payload, "provenance", "provenance"),
+            artifact_requests=list(raw_artifact_requests),
             correlation_id=_optional_string(payload, "correlationId", "correlationId"),
             embedding_model=_optional_string(payload, "embeddingModel", "embeddingModel"),
             classification=payload.get("classification"),
@@ -303,6 +329,11 @@ class DocumentVectorizeInput:
             "correlationId": self.correlation_id,
             "embeddingModel": self.embedding_model,
             "classification": self.classification,
+            "documentType": self.document_type,
+            "schemaId": self.schema_id,
+            "schemaVersion": self.schema_version,
+            "provenance": dict(self.provenance),
+            "artifactRequests": list(self.artifact_requests),
             "document": self.document.to_payload(),
             "chunks": [chunk.to_payload() for chunk in self.chunks],
             "storageReferences": [reference.to_payload() for reference in self.storage_references],
@@ -374,6 +405,10 @@ class DocumentVectorizeOutput:
             "manifestVersion": request.manifest_version,
             "correlationId": request.correlation_id,
             "embeddingModel": request.embedding_model,
+            "documentType": request.document_type,
+            "schemaId": request.schema_id,
+            "schemaVersion": request.schema_version,
+            "provenance": dict(request.provenance),
             "backend": dict(result.metadata),
             "options": request.options.to_payload(),
         }
@@ -646,6 +681,16 @@ def _optional_string(payload: Mapping[str, Any], key: str, label: str | None = N
     if not isinstance(value, str) or not value.strip():
         raise DocumentVectorizeValidationError(f"{label or key} must be a non-empty string")
     return value
+
+
+def _optional_root_or_document_string(
+    payload: Mapping[str, Any],
+    document: Mapping[str, Any],
+    key: str,
+) -> str | None:
+    if key in payload:
+        return _optional_string(payload, key, key)
+    return _optional_string(document, key, f"document.{key}")
 
 
 def _optional_mapping(payload: Mapping[str, Any], key: str, label: str) -> dict[str, Any]:
