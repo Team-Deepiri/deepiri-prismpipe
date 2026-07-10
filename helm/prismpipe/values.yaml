@@ -5,6 +5,17 @@ image:
   tag: "0.2.0"
   pullPolicy: IfNotPresent
 
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
 service:
   type: ClusterIP
   port: 80
