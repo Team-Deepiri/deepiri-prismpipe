@@ -3,16 +3,16 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install dependencies
-COPY pyproject.toml .
-COPY requirements.txt .
+COPY pyproject.toml README.md requirements.txt ./
+COPY src ./src
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir -e ".[all]"
+RUN pip install --no-cache-dir -e ".[server]"
 
 # Copy server
 COPY server.py .
 
 # Expose port
-EXPOSE 5011
+EXPOSE 8000
 
 # Run server
 ENV WEB_CONCURRENCY=4
