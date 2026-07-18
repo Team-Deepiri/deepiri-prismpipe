@@ -26,7 +26,6 @@ spec:
           image: deepiri/prismpipe:0.2.0
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
