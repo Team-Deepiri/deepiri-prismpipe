@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
+import inspect
 import json
+import math
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, AsyncGenerator, Callable
 
 import httpx
+from pydantic import BaseModel
 
 from prismpipe.core.envelope import (
     ExecutionPlan,
@@ -26,7 +31,8 @@ from prismpipe.core.envelope import (
     StateDiff,
     create_envelope,
 )
-from prismpipe.core.node import Node, NodeResult
+from prismpipe.core.node import Node, NodeResult, commit_envelope
+from prismpipe.core.pipeline import PipelineConfig
 from prismpipe.core.router import CapabilityRouter, NodeNotFoundError
 
 
@@ -57,45 +63,178 @@ class ComputationNode:
     capability: str
     input_hash: str
     output_hash: str
+    output_envelope: RequestEnvelope | None = None
+    output_state: dict[str, Any] = field(default_factory=dict)
+    next_capability: str | None = None
+    history_entries: list[HistoryEntry] = field(default_factory=list)
     execution_count: int = 1
     avg_latency_ms: float = 0.0
     success_rate: float = 1.0
     child_ids: list[str] = field(default_factory=list)
     parent_id: str | None = None
+    created_at: float = field(default_factory=time.monotonic)
+    last_accessed_at: float = field(default_factory=time.monotonic)
+
+
+class _UnshareableComputation(ValueError):
+    """Raised when an envelope cannot be serialized without ambiguity."""
+
+
+def _canonicalize_computation_value(value: Any) -> Any:
+    if value is None:
+        return ["none"]
+    if isinstance(value, Enum):
+        return [
+            "enum",
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            _canonicalize_computation_value(value.value),
+        ]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", str(value)]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _UnshareableComputation("Non-finite floats are not shareable")
+        return ["float", value.hex()]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, bytes):
+        return ["bytes", value.hex()]
+    if isinstance(value, datetime):
+        return ["datetime", value.isoformat()]
+    if isinstance(value, date):
+        return ["date", value.isoformat()]
+    if isinstance(value, uuid.UUID):
+        return ["uuid", str(value)]
+    if isinstance(value, BaseModel):
+        fields = [
+            [field_name, _canonicalize_computation_value(getattr(value, field_name))]
+            for field_name in sorted(type(value).model_fields)
+        ]
+        return [
+            "model",
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            fields,
+        ]
+    if isinstance(value, dict):
+        items = [
+            [
+                _canonicalize_computation_value(key),
+                _canonicalize_computation_value(item),
+            ]
+            for key, item in value.items()
+        ]
+        items.sort(
+            key=lambda pair: json.dumps(
+                pair[0],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return ["dict", items]
+    if isinstance(value, list):
+        return ["list", [_canonicalize_computation_value(item) for item in value]]
+    if isinstance(value, tuple):
+        return ["tuple", [_canonicalize_computation_value(item) for item in value]]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonicalize_computation_value(item) for item in value]
+        items.sort(
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return ["set" if isinstance(value, set) else "frozenset", items]
+    raise _UnshareableComputation(
+        f"Unsupported computation value type: {type(value).__name__}"
+    )
+
+
+def _serialize_computation_value(value: Any) -> str:
+    return json.dumps(
+        _canonicalize_computation_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 class ComputationGraph:
-    """Shared computation deduplication - compute once, reuse forever."""
+    """Bounded in-memory cache of complete successful envelope computations."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_entries: int = 256,
+        ttl_seconds: float | None = 300.0,
+    ) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive when provided")
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
         self._nodes: dict[str, ComputationNode] = {}
-        self._hash_to_node: dict[str, str] = {}
+        self._hash_to_node: OrderedDict[str, str] = OrderedDict()
         self._capability_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "total_latency": 0.0, "failures": 0}
         )
+        self._lock = threading.RLock()
 
-    def compute_input_hash(self, capability: str, input_data: dict[str, Any]) -> str:
-        content = json.dumps(
-            {"capability": capability, "input": input_data},
-            sort_keys=True,
-            default=str,
-        )
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    def compute_input_hash(
+        self,
+        capability: str,
+        input_data: dict[str, Any] | None = None,
+        state_data: dict[str, Any] | None = None,
+        version: str | None = None,
+        *,
+        envelope: RequestEnvelope | None = None,
+    ) -> str | None:
+        if envelope is None:
+            return None
+        try:
+            content = _serialize_computation_value(
+                {
+                    "capability": capability,
+                    "version": version,
+                    "envelope": envelope,
+                }
+            )
+        except Exception:
+            return None
+        return hashlib.sha256(content.encode()).hexdigest()
 
     def find_shared_computation(
         self,
         capability: str,
-        input_data: dict[str, Any],
+        input_data: dict[str, Any] | None = None,
+        state_data: dict[str, Any] | None = None,
+        version: str | None = None,
+        *,
+        envelope: RequestEnvelope | None = None,
     ) -> ComputationNode | None:
-        input_hash = self.compute_input_hash(capability, input_data)
+        input_hash = self.compute_input_hash(
+            capability,
+            input_data,
+            state_data,
+            version,
+            envelope=envelope,
+        )
+        if input_hash is None:
+            return None
         lookup_key = f"{capability}:{input_hash}"
-        
-        if lookup_key in self._hash_to_node:
-            node_id = self._hash_to_node[lookup_key]
+        now = time.monotonic()
+
+        with self._lock:
+            self._evict_expired_locked(now)
+            node_id = self._hash_to_node.get(lookup_key)
+            if node_id is None:
+                return None
             node = self._nodes[node_id]
             node.execution_count += 1
-            return node
-        return None
+            node.last_accessed_at = now
+            self._hash_to_node.move_to_end(lookup_key)
+            return copy.deepcopy(node)
 
     def register_computation(
         self,
@@ -105,75 +244,129 @@ class ComputationGraph:
         latency_ms: float,
         success: bool,
         parent_node_id: str | None = None,
-    ) -> ComputationNode:
-        input_hash = self.compute_input_hash(capability, input_data)
-        output_hash = hashlib.sha256(
-            json.dumps(output_data, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-        
-        node_id = f"comp_{uuid.uuid4().hex[:8]}"
-        lookup_key = f"{capability}:{input_hash}"
-        
-        if lookup_key in self._hash_to_node:
-            existing_id = self._hash_to_node[lookup_key]
-            existing = self._nodes[existing_id]
-            existing.execution_count += 1
-            existing.avg_latency_ms = (
-                (existing.avg_latency_ms * (existing.execution_count - 1) + latency_ms)
-                / existing.execution_count
-            )
-            return existing
-        
-        node = ComputationNode(
-            id=node_id,
-            capability=capability,
-            input_hash=input_hash,
-            output_hash=output_hash,
-            avg_latency_ms=latency_ms,
-            success_rate=1.0 if success else 0.0,
-            parent_id=parent_node_id,
+        *,
+        state_data: dict[str, Any] | None = None,
+        version: str | None = None,
+        next_capability: str | None = None,
+        history_entries: list[HistoryEntry] | None = None,
+        input_envelope: RequestEnvelope | None = None,
+        output_envelope: RequestEnvelope | None = None,
+    ) -> ComputationNode | None:
+        with self._lock:
+            stats = self._capability_stats[capability]
+            stats["count"] += 1
+            stats["total_latency"] += latency_ms
+            if not success:
+                stats["failures"] += 1
+                return None
+
+        if input_envelope is None or output_envelope is None:
+            return None
+        input_hash = self.compute_input_hash(
+            capability,
+            input_data,
+            state_data,
+            version,
+            envelope=input_envelope,
         )
-        
-        self._nodes[node_id] = node
-        self._hash_to_node[lookup_key] = node_id
-        
-        if parent_node_id and parent_node_id in self._nodes:
-            self._nodes[parent_node_id].child_ids.append(node_id)
-        
-        stats = self._capability_stats[capability]
-        stats["count"] += 1
-        stats["total_latency"] += latency_ms
-        if not success:
-            stats["failures"] += 1
-        
-        return node
+        if input_hash is None:
+            return None
+
+        try:
+            cached_envelope = output_envelope.model_copy(deep=True)
+            serialized_output = _serialize_computation_value(cached_envelope)
+        except Exception:
+            return None
+
+        output_hash = hashlib.sha256(serialized_output.encode()).hexdigest()
+        lookup_key = f"{capability}:{input_hash}"
+        now = time.monotonic()
+
+        with self._lock:
+            self._evict_expired_locked(now)
+            existing_id = self._hash_to_node.get(lookup_key)
+            if existing_id is not None:
+                existing = self._nodes[existing_id]
+                existing.avg_latency_ms = (existing.avg_latency_ms + latency_ms) / 2
+                existing.last_accessed_at = now
+                self._hash_to_node.move_to_end(lookup_key)
+                return copy.deepcopy(existing)
+
+            node_id = f"comp_{uuid.uuid4().hex[:8]}"
+            node = ComputationNode(
+                id=node_id,
+                capability=capability,
+                input_hash=input_hash,
+                output_hash=output_hash,
+                output_envelope=cached_envelope,
+                output_state=copy.deepcopy(cached_envelope.state),
+                next_capability=cached_envelope.next,
+                history_entries=copy.deepcopy(history_entries or []),
+                avg_latency_ms=latency_ms,
+                parent_id=parent_node_id,
+                created_at=now,
+                last_accessed_at=now,
+            )
+            self._nodes[node_id] = node
+            self._hash_to_node[lookup_key] = node_id
+
+            if parent_node_id and parent_node_id in self._nodes:
+                self._nodes[parent_node_id].child_ids.append(node_id)
+
+            self._evict_lru_locked()
+            return copy.deepcopy(node)
 
     def get_deduplication_stats(self) -> dict[str, Any]:
-        total_computations = len(self._nodes)
-        total_reuses = sum(n.execution_count - 1 for n in self._nodes.values())
-        
-        return {
-            "unique_computations": total_computations,
-            "total_reuses": total_reuses,
-            "deduplication_ratio": total_reuses / max(total_computations, 1),
-            "capability_stats": {
-                cap: {
+        with self._lock:
+            self._evict_expired_locked(time.monotonic())
+            total_computations = len(self._nodes)
+            total_reuses = sum(node.execution_count - 1 for node in self._nodes.values())
+            capability_stats = {
+                capability: {
                     "count": stats["count"],
                     "avg_latency": stats["total_latency"] / max(stats["count"], 1),
                     "success_rate": 1 - (stats["failures"] / max(stats["count"], 1)),
                 }
-                for cap, stats in self._capability_stats.items()
-            },
+                for capability, stats in self._capability_stats.items()
+            }
+
+        return {
+            "unique_computations": total_computations,
+            "total_reuses": total_reuses,
+            "deduplication_ratio": total_reuses / max(total_computations, 1),
+            "capability_stats": capability_stats,
         }
 
     def get_computation_path(self, node_id: str) -> list[ComputationNode]:
-        path = []
-        current_id = node_id
-        while current_id and current_id in self._nodes:
-            node = self._nodes[current_id]
-            path.insert(0, node)
-            current_id = node.parent_id
-        return path
+        with self._lock:
+            path = []
+            current_id = node_id
+            while current_id and current_id in self._nodes:
+                node = self._nodes[current_id]
+                path.insert(0, copy.deepcopy(node))
+                current_id = node.parent_id
+            return path
+
+    def _evict_expired_locked(self, now: float) -> None:
+        if self.ttl_seconds is None:
+            return
+        expired = [
+            lookup_key
+            for lookup_key, node_id in self._hash_to_node.items()
+            if now - self._nodes[node_id].created_at >= self.ttl_seconds
+        ]
+        for lookup_key in expired:
+            self._remove_locked(lookup_key)
+
+    def _evict_lru_locked(self) -> None:
+        while len(self._hash_to_node) > self.max_entries:
+            lookup_key = next(iter(self._hash_to_node))
+            self._remove_locked(lookup_key)
+
+    def _remove_locked(self, lookup_key: str) -> None:
+        node_id = self._hash_to_node.pop(lookup_key, None)
+        if node_id is not None:
+            self._nodes.pop(node_id, None)
 
 
 class Organism:
@@ -446,24 +639,23 @@ class Organism:
 
 
 class TimeSplitter:
-    """
-    EXPLORE MULTIPLE FUTURES IN PARALLEL.
-    
-    Fork execution into multiple branches, first successful wins.
-    
-         organism
-           / | \\
-         A    B  C
-         ↓    ↓   ↓
-      fast  slow crash
-         \\   |   /
-          result ← wins
-    """
+    """Execute a bounded set of speculative branches until the first succeeds."""
 
-    def __init__(self, router: CapabilityRouter) -> None:
+    def __init__(
+        self,
+        router: CapabilityRouter,
+        max_branches: int = 4,
+        timeout_ms: int = 5000,
+        max_iterations: int = 100,
+    ) -> None:
+        if max_branches <= 0:
+            raise ValueError("max_branches must be positive")
+        if timeout_ms <= 0:
+            raise ValueError("timeout_ms must be positive")
         self._router = router
-        self._max_branches = 4
-        self._timeout_ms = 5000
+        self._max_branches = max_branches
+        self._timeout_ms = timeout_ms
+        self._max_iterations = max_iterations
 
     def split(
         self,
@@ -471,9 +663,8 @@ class TimeSplitter:
         branch_capabilities: list[str],
     ) -> list[Organism]:
         branches = []
-        for i, cap in enumerate(branch_capabilities[:self._max_branches]):
-            branch = organism.spawn_child()
-            branch._next_capability = cap
+        for capability in branch_capabilities[: self._max_branches]:
+            branch = organism.spawn_child(initial_capability=capability)
             branch._state = OrganismState.EXPLORING
             branches.append(branch)
         return branches
@@ -483,44 +674,14 @@ class TimeSplitter:
         branch: Organism,
         computation_graph: ComputationGraph,
     ) -> Organism:
-        start_time = time.perf_counter()
-        
-        while branch._next_capability and not branch.terminated:
-            capability = branch.get_capability()
-            if not capability:
-                break
-                
-            shared = computation_graph.find_shared_computation(
-                capability,
-                branch.input,
-            )
-            
-            if shared:
-                branch.state["_from_shared"] = True
-                branch.state["_shared_node_id"] = shared.id
-            else:
-                try:
-                    node = self._router.resolve(capability)
-                    result = node.execute(branch.envelope)
-                    branch.state = dict(result.envelope.state)
-                    branch.history = list(result.envelope.history)
-                    
-                    latency = (time.perf_counter() - start_time) * 1000
-                    
-                    computation_graph.register_computation(
-                        capability=capability,
-                        input_data=branch.input,
-                        output_data=branch.state,
-                        latency_ms=latency,
-                        success=True,
-                    )
-                except Exception as e:
-                    branch.terminate(str(e))
-                    
-            branch._next_capability = branch._plan.next()
-            
-        branch._state = OrganismState.LEARNING
-        return branch
+        executor = OrganismExecutor(
+            self._router,
+            PipelineConfig(
+                max_iterations=self._max_iterations,
+                timeout_seconds=self._timeout_ms / 1000,
+            ),
+        )
+        return await executor.execute(branch, computation_graph)
 
     async def execute_time_split(
         self,
@@ -529,32 +690,67 @@ class TimeSplitter:
         computation_graph: ComputationGraph,
     ) -> Organism:
         branches = self.split(organism, branch_capabilities)
-        
-        async def run_branch(b: Organism) -> Organism:
-            try:
-                return await self.execute_branch(b, computation_graph)
-            except Exception as e:
-                b.terminate(str(e))
-                return b
-        
-        tasks = [run_branch(b) for b in branches]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        successful = [
-            r for r in results
-            if isinstance(r, Organism) and not r.terminated
-        ]
-        
-        if successful:
-            winner = min(successful, key=lambda r: r.execution_time_ms or float('inf'))
-            organism.state = dict(winner.state)
-            organism.history = list(winner.history)
-            organism._children = branches
-            organism._state = OrganismState.LEARNING
+        organism._children = branches
+        if not branches:
+            organism.terminate("No eligible time-split branches")
             return organism
-        
-        organism.terminate("All branches failed")
-        return organism
+
+        async def run_branch(branch: Organism) -> Organism:
+            try:
+                return await self.execute_branch(branch, computation_graph)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                branch.terminate(str(error))
+                return branch
+
+        tasks = [
+            asyncio.create_task(run_branch(branch), name=f"prismpipe-branch-{index}")
+            for index, branch in enumerate(branches)
+        ]
+        task_order = {task: index for index, task in enumerate(tasks)}
+
+        try:
+            async with asyncio.timeout(self._timeout_ms / 1000):
+                pending = set(tasks)
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in sorted(done, key=task_order.__getitem__):
+                        result = task.result()
+                        if result.terminated:
+                            continue
+                        await self._cancel_tasks(pending)
+                        organism.state = copy.deepcopy(result.state)
+                        organism.history = copy.deepcopy(result.history)
+                        organism._next_capability = result._next_capability
+                        organism._state = OrganismState.LEARNING
+                        return organism
+
+            organism.terminate("All time-split branches failed")
+            return organism
+        except TimeoutError:
+            await self._cancel_tasks(tasks)
+            organism.terminate(
+                f"Time split timed out after {self._timeout_ms / 1000:g}s"
+            )
+            return organism
+        except asyncio.CancelledError:
+            await self._cancel_tasks(tasks)
+            raise
+        finally:
+            await self._cancel_tasks(tasks)
+
+    @staticmethod
+    async def _cancel_tasks(tasks: Any) -> None:
+        task_list = list(tasks)
+        for task in task_list:
+            if not task.done():
+                task.cancel()
+        if task_list:
+            await asyncio.gather(*task_list, return_exceptions=True)
 
 
 class PipelineEvolver:
@@ -707,14 +903,21 @@ class IntentPlanner:
 
 
 class SwarmCoordinator:
-    """
-    ORGANISM SWARM COMPUTING.
-    
-    Multiple organisms collaborate on a single problem.
-    Like MapReduce, but request-native.
-    """
+    """Execute swarm workers with bounded concurrency and deterministic reduction."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        router: CapabilityRouter | None = None,
+        max_concurrency: int = 4,
+        worker_timeout_seconds: float | None = 30.0,
+        max_iterations: int = 100,
+    ) -> None:
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
+        self._router = router
+        self._max_concurrency = max_concurrency
+        self._worker_timeout_seconds = worker_timeout_seconds
+        self._max_iterations = max_iterations
         self._swarms: dict[str, list[Organism]] = {}
         self._shared_state: dict[str, dict[str, Any]] = {}
         self._partition_fn: Callable[[Any], str] | None = None
@@ -727,12 +930,12 @@ class SwarmCoordinator:
         count: int,
     ) -> list[Organism]:
         swarm = []
-        for i in range(count):
+        for index in range(count):
             worker = template.spawn_child()
-            worker.id = f"{swarm_id}_worker_{i}"
+            worker.id = f"{swarm_id}_worker_{index}"
             worker._state = OrganismState.EXPLORING
             swarm.append(worker)
-            
+
         self._swarms[swarm_id] = swarm
         self._shared_state[swarm_id] = {}
         return swarm
@@ -752,25 +955,113 @@ class SwarmCoordinator:
     ) -> Any:
         if swarm_id not in self._swarms:
             raise ValueError(f"Swarm {swarm_id} not found")
-            
+        if self._router is None:
+            raise RuntimeError("Swarm coordinator has no capability router")
+
         swarm = self._swarms[swarm_id]
-        
+        if not swarm:
+            raise ValueError(f"Swarm {swarm_id} has no workers")
+
+        self._assign_partitions(swarm, data)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for index in range(len(swarm)):
+            queue.put_nowait(index)
+
+        executor = OrganismExecutor(
+            self._router,
+            PipelineConfig(
+                max_iterations=self._max_iterations,
+                timeout_seconds=self._worker_timeout_seconds,
+            ),
+        )
+        completed: list[Organism | None] = [None] * len(swarm)
+
+        async def run_workers() -> None:
+            while True:
+                try:
+                    index = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                worker = swarm[index]
+                worker.set_next(capability)
+                try:
+                    completed[index] = await executor.execute(worker, computation_graph)
+                except asyncio.CancelledError:
+                    worker._state = OrganismState.SUSPENDED
+                    raise
+                except Exception as error:
+                    worker.terminate(str(error))
+                    completed[index] = worker
+                finally:
+                    queue.task_done()
+
+        tasks = [
+            asyncio.create_task(run_workers(), name=f"prismpipe-swarm-runner-{index}")
+            for index in range(min(self._max_concurrency, len(swarm)))
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            await self._cancel_tasks(tasks)
+            raise
+        except Exception:
+            await self._cancel_tasks(tasks)
+            raise
+        finally:
+            await self._cancel_tasks(tasks)
+
+        successful = [
+            worker
+            for worker in completed
+            if worker is not None and not worker.terminated
+        ]
+        if not successful:
+            failures = [
+                worker.state.get("_error", "worker failed")
+                for worker in completed
+                if worker is not None
+            ]
+            raise RuntimeError(
+                f"All swarm workers failed: {'; '.join(failures) or 'no results'}"
+            )
+
+        reducer = self._reducers.get(swarm_id, lambda workers: workers)
+        try:
+            if inspect.iscoroutinefunction(reducer):
+                return await reducer(successful)
+            reduced = await asyncio.to_thread(reducer, successful)
+            if inspect.isawaitable(reduced):
+                return await reduced
+            return reduced
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeError(f"Swarm reducer failed: {error}") from error
+
+    def _assign_partitions(self, swarm: list[Organism], data: list[Any]) -> None:
+        worker_partitions: list[list[Any]] = [[] for _ in swarm]
         if self._partition_fn:
-            partitions: dict[str, list[Any]] = defaultdict(list)
+            grouped: dict[str, list[Any]] = {}
             for item in data:
-                partition_key = self._partition_fn(item)
-                partitions[partition_key].append(item)
-                
-            for i, worker in enumerate(swarm):
-                partition_data = list(partitions.values())[i % len(partitions)] if partitions else []
-                worker.input["partition_data"] = partition_data
-        
-        results = []
-        for worker in swarm:
-            worker.set_next(capability)
-            
-        reducer = self._reducers.get(swarm_id, lambda x: x)
-        return reducer(results)
+                key = self._partition_fn(item)
+                grouped.setdefault(key, []).append(item)
+            for index, partition in enumerate(grouped.values()):
+                worker_partitions[index % len(swarm)].extend(partition)
+        else:
+            for index, item in enumerate(data):
+                worker_partitions[index % len(swarm)].append(item)
+
+        for worker, partition in zip(swarm, worker_partitions):
+            worker.input["partition_data"] = partition
+
+    @staticmethod
+    async def _cancel_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_swarm_results(self, swarm_id: str) -> list[Organism]:
         return self._swarms.get(swarm_id, [])
@@ -922,14 +1213,15 @@ class GravityEngine:
 
 
 class OrganismExecutor:
-    """
-    EXECUTES ORGANISMS THROUGH CAPABILITY PIPELINES.
-    
-    Handles the full lifecycle: spawn → explore → execute → learn → store.
-    """
+    """Execute organisms with bounded iterations, deadlines, and safe sharing."""
 
-    def __init__(self, router: CapabilityRouter) -> None:
+    def __init__(
+        self,
+        router: CapabilityRouter,
+        config: PipelineConfig | None = None,
+    ) -> None:
         self._router = router
+        self._config = config or PipelineConfig()
 
     async def execute(
         self,
@@ -937,19 +1229,17 @@ class OrganismExecutor:
         computation_graph: ComputationGraph | None = None,
     ) -> Organism:
         computation_graph = computation_graph or ComputationGraph()
-        
         organism._state = OrganismState.EXECUTING
-        start_time = time.perf_counter()
-        
-        # Create envelope ONCE and keep reference to it
-        # Don't use organism.envelope property in the loop!
+        started_at = time.monotonic()
+        iterations = 0
+
         intent_value = organism.intent
         if isinstance(intent_value, str):
             try:
                 intent_value = Intent(intent_value)
             except ValueError:
                 intent_value = Intent.CUSTOM
-        
+
         envelope = RequestEnvelope(
             id=organism.id,
             intent=intent_value,
@@ -961,56 +1251,111 @@ class OrganismExecutor:
             next=organism._next_capability,
             parent_id=organism._parent_organism_id,
         )
-        
-        while organism._next_capability and not organism.terminated:
-            capability = organism.get_capability()
-            if not capability:
-                break
-            
-            shared = computation_graph.find_shared_computation(capability, organism.input)
-            
-            if shared:
-                organism.state["_from_shared"] = True
-                organism.state["_shared_node_id"] = shared.id
-                organism._computation_node_id = shared.id
-                # Terminate since we're reusing shared computation
-                envelope.next = None
-            else:
+
+        try:
+            while organism._next_capability and not organism.terminated:
+                if iterations >= self._config.max_iterations:
+                    organism._next_capability = None
+                    organism.terminate(
+                        f"Max iterations ({self._config.max_iterations}) exceeded"
+                    )
+                    break
+
+                remaining_timeout = self._remaining_timeout(started_at)
+                if remaining_timeout is not None and remaining_timeout <= 0:
+                    organism._next_capability = None
+                    organism.terminate(
+                        f"Organism timed out after {self._config.timeout_seconds:g}s"
+                    )
+                    break
+
+                capability = organism.get_capability()
+                if not capability:
+                    break
+                iterations += 1
+
                 try:
                     node = self._router.resolve(capability)
-                    result = node.execute(envelope)
-                    
-                    # Update envelope reference from result
+                except NodeNotFoundError:
+                    organism._next_capability = None
+                    organism.terminate(f"Node not found: {capability}")
+                    break
+
+                input_envelope = envelope.model_copy(deep=True)
+                shared = computation_graph.find_shared_computation(
+                    capability,
+                    organism.input,
+                    version=node.version,
+                    envelope=envelope,
+                )
+
+                if shared is not None and shared.output_envelope is not None:
+                    commit_envelope(envelope, shared.output_envelope)
+                    self._sync_organism_from_envelope(organism, envelope)
+                    organism._computation_node_id = shared.id
+                else:
+                    history_count = len(envelope.history)
+                    node_started_at = time.perf_counter()
+                    result = await node.execute_async(
+                        envelope,
+                        timeout_seconds=remaining_timeout,
+                    )
                     envelope = result.envelope
-                    organism.state = dict(envelope.state)
-                    organism.history = list(envelope.history)
-                    
-                    latency = (time.perf_counter() - start_time) * 1000
-                    success = result.success and not envelope.terminated
-                    
+                    self._sync_organism_from_envelope(organism, envelope)
+
+                    success = (
+                        result.success
+                        and not envelope.terminated
+                        and envelope.error is None
+                    )
                     computation_graph.register_computation(
                         capability=capability,
                         input_data=organism.input,
                         output_data=organism.state,
-                        latency_ms=latency,
+                        latency_ms=(time.perf_counter() - node_started_at) * 1000,
                         success=success,
+                        version=node.version,
+                        history_entries=envelope.history[history_count:],
+                        input_envelope=input_envelope,
+                        output_envelope=envelope,
                     )
-                    
+
                     if not success:
                         organism._next_capability = None
                         organism.terminate(result.error or envelope.error)
                         break
-                except Exception as e:
-                    organism._next_capability = None
-                    organism.terminate(str(e))
-                    break
-            
-            # Sync next capability from envelope
-            organism._next_capability = envelope.next
-        
+
+                organism._next_capability = envelope.next
+
+        except asyncio.CancelledError:
+            organism._state = OrganismState.SUSPENDED
+            raise
+
         if not organism.terminated:
             organism._state = OrganismState.LEARNING
         return organism
+
+    @staticmethod
+    def _sync_organism_from_envelope(
+        organism: Organism,
+        envelope: RequestEnvelope,
+    ) -> None:
+        organism.id = envelope.id
+        organism.intent = envelope.intent
+        organism.input = copy.deepcopy(envelope.input)
+        organism.state = copy.deepcopy(envelope.state)
+        organism.history = copy.deepcopy(envelope.history)
+        organism.metadata = envelope.metadata.model_copy(deep=True)
+        organism._plan = envelope.plan.model_copy(deep=True)
+        organism._next_capability = envelope.next
+        organism._parent_organism_id = envelope.parent_id
+        if envelope.terminated:
+            organism.terminate(envelope.error)
+
+    def _remaining_timeout(self, started_at: float) -> float | None:
+        if self._config.timeout_seconds is None:
+            return None
+        return self._config.timeout_seconds - (time.monotonic() - started_at)
 
 
 class ReplayEngine:
@@ -1561,7 +1906,15 @@ class RequestMemory:
 class PrismEngine:
     """The complete PrismPipe execution engine with organic request processing."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig | None = None,
+        *,
+        computation_cache_max_entries: int = 256,
+        computation_cache_ttl_seconds: float | None = 300.0,
+        swarm_max_concurrency: int = 4,
+    ) -> None:
+        self._config = config or PipelineConfig()
         self.router = CapabilityRouter()
         self.replay_engine = ReplayEngine()
         self.diff_engine = DiffEngine()
@@ -1572,14 +1925,22 @@ class PrismEngine:
         self.request_memory = RequestMemory()
         self.ancestry_tree = AncestryTree()
         self.semantic_cache = SemanticCache()
-        
-        self.computation_graph = ComputationGraph()
+
+        self.computation_graph = ComputationGraph(
+            max_entries=computation_cache_max_entries,
+            ttl_seconds=computation_cache_ttl_seconds,
+        )
         self.organism_registry = OrganismRegistry()
         self.pipeline_evolver = PipelineEvolver()
         self.intent_planner = IntentPlanner(self.router)
-        self.swarm_coordinator = SwarmCoordinator()
+        self.swarm_coordinator = SwarmCoordinator(
+            self.router,
+            max_concurrency=swarm_max_concurrency,
+            worker_timeout_seconds=self._config.timeout_seconds or 30.0,
+            max_iterations=self._config.max_iterations,
+        )
         self.gravity_engine = GravityEngine()
-        self.organism_executor = OrganismExecutor(self.router)
+        self.organism_executor = OrganismExecutor(self.router, self._config)
 
     def register_node(
         self,
@@ -1672,8 +2033,21 @@ class PrismEngine:
         organism: Organism,
         branch_capabilities: list[str],
     ) -> Organism:
-        splitter = TimeSplitter(self.router)
-        return await splitter.execute_time_split(organism, branch_capabilities, self.computation_graph)
+        timeout_ms = (
+            int(self._config.timeout_seconds * 1000)
+            if self._config.timeout_seconds is not None
+            else 5000
+        )
+        splitter = TimeSplitter(
+            self.router,
+            timeout_ms=timeout_ms,
+            max_iterations=self._config.max_iterations,
+        )
+        return await splitter.execute_time_split(
+            organism,
+            branch_capabilities,
+            self.computation_graph,
+        )
 
     def create_swarm(
         self,
@@ -1717,51 +2091,98 @@ class PrismEngine:
         return organism
 
     async def execute(self, envelope: RequestEnvelope) -> RequestEnvelope:
-        intent_str = envelope.intent.value if isinstance(envelope.intent, Intent) else str(envelope.intent)
-        
+        intent_str = (
+            envelope.intent.value
+            if isinstance(envelope.intent, Intent)
+            else str(envelope.intent)
+        )
+
         cached = self.semantic_cache.get(intent_str, envelope.input)
-        
         if cached:
             envelope.state["_from_cache"] = True
-            envelope.state["_cached_result"] = cached.state
+            envelope.state["_cached_result"] = copy.deepcopy(cached.state)
             return envelope
-            
-        start_state = dict(envelope.state)
-        
-        while envelope.next and not envelope.terminated:
-            capability = envelope.get_capability()
-            if not capability:
-                break
-                
-            if self.remote_executor.is_remote(capability):
-                envelope = await self.remote_executor.execute_remote(capability, envelope)
-            else:
-                try:
-                    node = self.router.resolve(capability)
-                    result = node.execute(envelope)
-                    envelope = result.envelope
-                    
-                    diff = self.diff_engine.compute_diff(envelope, start_state)
-                    self.diff_engine.record(envelope, diff)
-                    
-                except NodeNotFoundError:
-                    envelope.terminate(f"Node not found: {capability}")
+
+        started_at = time.monotonic()
+        iterations = 0
+
+        try:
+            while envelope.next and not envelope.terminated:
+                if iterations >= self._config.max_iterations:
+                    envelope.terminate(
+                        f"Max iterations ({self._config.max_iterations}) exceeded"
+                    )
                     break
-                    
-            if envelope.plan and envelope.plan.capabilities:
-                if not envelope.next:
+
+                remaining_timeout = self._remaining_timeout(started_at)
+                if remaining_timeout is not None and remaining_timeout <= 0:
+                    envelope.terminate(
+                        f"Engine execution timed out after "
+                        f"{self._config.timeout_seconds:g}s"
+                    )
+                    break
+
+                capability = envelope.get_capability()
+                if not capability:
+                    break
+                iterations += 1
+                before_state = copy.deepcopy(envelope.state)
+
+                if self.remote_executor.is_remote(capability):
+                    try:
+                        operation = self.remote_executor.execute_remote(
+                            capability,
+                            envelope,
+                        )
+                        if remaining_timeout is None:
+                            envelope = await operation
+                        else:
+                            envelope = await asyncio.wait_for(
+                                operation,
+                                timeout=remaining_timeout,
+                            )
+                    except asyncio.TimeoutError:
+                        envelope.terminate(
+                            f"Remote capability '{capability}' timed out"
+                        )
+                        break
+                else:
+                    try:
+                        node = self.router.resolve(capability)
+                    except NodeNotFoundError:
+                        envelope.terminate(f"Node not found: {capability}")
+                        break
+
+                    result = await node.execute_async(
+                        envelope,
+                        timeout_seconds=remaining_timeout,
+                    )
+                    envelope = result.envelope
+                    diff = self.diff_engine.compute_diff(envelope, before_state)
+                    self.diff_engine.record(envelope, diff)
+                    if not result.success or envelope.terminated:
+                        envelope.terminate(result.error or envelope.error)
+                        break
+
+                if envelope.plan and envelope.plan.capabilities and not envelope.next:
                     envelope.next = envelope.plan.next()
-                    
+
+        except asyncio.CancelledError:
+            raise
+
         self.request_memory.store(envelope)
         self.ancestry_tree.add_child(envelope.parent_id or "", envelope.id)
-        
-        if envelope.history:
-            path = [h.capability for h in envelope.history]
+
+        if envelope.history and not envelope.terminated:
             self.semantic_cache.set(intent_str, envelope.input, envelope)
-            
+
         self.replay_engine.snapshot(envelope, f"final_{envelope.id}")
-        
         return envelope
+
+    def _remaining_timeout(self, started_at: float) -> float | None:
+        if self._config.timeout_seconds is None:
+            return None
+        return self._config.timeout_seconds - (time.monotonic() - started_at)
 
 
 class OrganismMutation:
