@@ -87,6 +87,13 @@ class ComputationGraph:
         )
 
     def compute_input_hash(self, capability: str, input_data: dict[str, Any]) -> str:
+        """Hash capability + input for dedup.
+
+        Expected input shapes are JSON-friendly dicts/lists/primitives (as used by
+        Deepiri probe pipelines). `default=str` is a best-effort fallback for odd
+        values; callers should prefer canonical JSON-serializable payloads so
+        hashes stay deterministic across processes.
+        """
         content = json.dumps(
             {"capability": capability, "input": input_data},
             sort_keys=True,
@@ -1233,7 +1240,8 @@ class OrganismExecutor:
                 else:
                     try:
                         node = self._router.resolve(capability)
-                        result = node.execute(envelope)
+                        # Nodes may do blocking HTTP/CPU work; never block the event loop.
+                        result = await asyncio.to_thread(node.execute, envelope)
 
                         envelope = result.envelope
                         organism.state = dict(envelope.state)

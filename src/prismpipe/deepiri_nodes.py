@@ -19,7 +19,9 @@ def _env_url(name: str, default: str) -> str:
     return os.getenv(name, default).rstrip("/")
 
 
-def _http_get_json(url: str, timeout_s: float = 0.8) -> dict[str, Any]:
+def _http_get_json(url: str, timeout_s: float | None = None) -> dict[str, Any]:
+    if timeout_s is None:
+        timeout_s = float(os.getenv("DEEPIRI_PROBE_TIMEOUT_S", "0.8"))
     try:
         timeout = httpx.Timeout(timeout_s, connect=min(0.4, timeout_s))
         with httpx.Client(timeout=timeout) as client:
@@ -90,7 +92,10 @@ class DeepiriCyrexHealthNode(Node):
             }
             envelope.set_next("deepiri.aggregate")
             return NodeResult(envelope=envelope, success=True)
-        result = _http_get_json(f"{raw.rstrip('/')}/health", timeout_s=0.5)
+        result = _http_get_json(
+            f"{raw.rstrip('/')}/health",
+            timeout_s=float(os.getenv("DEEPIRI_CYREX_PROBE_TIMEOUT_S", "0.5")),
+        )
         envelope.state["cyrex_health"] = result
         envelope.set_next("deepiri.aggregate")
         return NodeResult(envelope=envelope, success=True)

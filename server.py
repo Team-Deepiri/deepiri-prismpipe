@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from prismpipe import PrismEngine, create_envelope
+from prismpipe import OrganismPersistence, PrismEngine, create_envelope
 from prismpipe.core import Intent, Node, NodeResult
 from prismpipe.deepiri_nodes import register_deepiri_nodes
 from prismpipe.events import get_event_bus
@@ -45,7 +45,7 @@ def _configure_persistence() -> None:
         from prismpipe.storage_postgres import PostgresStorage
 
         backend = PostgresStorage(dsn=database_url)
-    engine.organism_persistence = type(engine.organism_persistence)(storage_backend=backend)
+    engine.organism_persistence = OrganismPersistence(storage_backend=backend)
 
 
 _configure_persistence()
