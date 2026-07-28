@@ -80,7 +80,10 @@ celerybeat-schedule
 celerybeat.pid
 cover/
 coverage.xml
-cython_debug/scripts/bench/last_results.json
+cython_debug/
+scripts/bench/last_results.json
+scripts/bench/*.json
+!scripts/bench/.gitkeep
 db.sqlite3
 db.sqlite3-journal
 dist/
