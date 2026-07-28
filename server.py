@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -441,7 +441,6 @@ class DeepiriSessionRequest(BaseModel):
 
 @app.post("/pipelines/deepiri/session")
 async def deepiri_session_pipeline(
-    background_tasks: BackgroundTasks,
     body: DeepiriSessionRequest | None = None,
 ):
     """Productivity pipeline: auth verify ∥ LIS health in one call.
@@ -515,6 +514,8 @@ async def deepiri_session_pipeline(
                 session = await boot_task
                 latency_ms = 0.0
                 if payload.use_computation_sharing:
+                    # Sync Redis so birth-warm login is visible to every worker
+                    # before the JWT is returned to the client.
                     graph.register_computation(
                         capability=SESSION_CAPABILITY,
                         input_data=fingerprint,
@@ -522,16 +523,7 @@ async def deepiri_session_pipeline(
                         latency_ms=latency_ms,
                         success=bool(session.get("useful")),
                         next_capability=None,
-                        persist_redis=False,
-                    )
-                    background_tasks.add_task(
-                        graph.persist_computation_to_redis,
-                        SESSION_CAPABILITY,
-                        fingerprint,
-                        {"session": session},
-                        latency_ms,
-                        bool(session.get("useful")),
-                        None,
+                        persist_redis=True,
                     )
         except Exception:
             if not boot_task.done():
