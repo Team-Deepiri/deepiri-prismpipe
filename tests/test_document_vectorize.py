@@ -255,11 +255,14 @@ async def test_invalid_payload_fails_cleanly_without_backend_call():
     assert error["model"] == "deterministic-v1"
 
 
-def test_missing_chunk_text_raises_document_vectorize_validation_error():
+def test_chunk_without_text_or_storage_raises_document_vectorize_validation_error():
     payload = canonical_payload()
     payload["chunks"][0].pop("text")
 
-    with pytest.raises(DocumentVectorizeValidationError, match=r"chunks\[0\]\.text"):
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match=r"chunks\[0\] must include text or storage",
+    ):
         DocumentVectorizeInput.from_payload(payload)
 
 
@@ -292,7 +295,8 @@ async def test_invalid_backend_dimensions_are_rejected(backend_dimensions):
     assert result.success is False
     assert result.output is None
     assert result.error is not None
-    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["retryable"] is False
     assert result.error["details"]["error"] == "Vectorizer returned invalid vector dimensions"
 
 
@@ -314,7 +318,8 @@ async def test_swapped_backend_chunk_ids_are_rejected():
     assert result.success is False
     assert result.output is None
     assert result.error is not None
-    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["retryable"] is False
     assert result.error["details"]["error"] == "Vectorizer returned mismatched chunk id for chunks[0]"
 
 
@@ -360,6 +365,7 @@ async def test_output_shape_includes_required_vectorization_fields():
         "provider",
         "model",
         "metadata",
+        "artifacts",
     }
     assert set(output["chunks"][0]) == {"chunkId", "text", "vector", "metadata"}
     assert isinstance(output["chunks"][0]["vector"], list)
@@ -545,7 +551,7 @@ def test_route_schema_fields_fall_back_to_nested_document():
     assert serialized["schemaVersion"] == "nested-1.0"
 
 
-def test_root_route_schema_fields_take_precedence_over_nested_document():
+def test_conflicting_root_and_nested_schema_fields_are_rejected():
     payload = canonical_payload()
     payload["document"].update(
         {
@@ -555,11 +561,11 @@ def test_root_route_schema_fields_take_precedence_over_nested_document():
         }
     )
 
-    parsed = DocumentVectorizeInput.from_payload(payload)
-
-    assert parsed.document_type == "lease"
-    assert parsed.schema_id == "document.route.v1"
-    assert parsed.schema_version == "1.0"
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match="documentType must match document.documentType",
+    ):
+        DocumentVectorizeInput.from_payload(payload)
 
 
 def test_artifact_requests_must_be_a_list():

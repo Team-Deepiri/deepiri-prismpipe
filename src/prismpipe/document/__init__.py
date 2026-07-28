@@ -14,13 +14,33 @@ from prismpipe.document.vectorize import (
     VectorizeBackendResult,
     VectorizeOptions,
     VectorizedChunk,
+    ArtifactRequest,
+    ArtifactResult,
     Vectorizer,
     execute_document_vectorize,
+)
+from prismpipe.document.operations import (
+    DocumentOperationRecord,
+    DocumentOperationStatus,
+    DocumentProcessingError,
+    IdempotencyConflictError,
+    PublicationState,
+    SQLiteDocumentOperationStore,
+)
+from prismpipe.document.processing import (
+    DocumentProcessingResult,
+    DocumentVectorizeConsumer,
+    DocumentVectorizeProcessor,
+    build_document_idempotency_key,
+    build_document_operation_id,
+    build_document_request_fingerprint,
 )
 
 __all__ = [
     "DOCUMENT_VECTORIZE_CAPABILITY",
     "DOCUMENT_VECTORIZE_INPUT_KEY",
+    "ArtifactRequest",
+    "ArtifactResult",
     "ChunkReference",
     "DocumentReference",
     "DocumentVectorizeError",
@@ -34,4 +54,16 @@ __all__ = [
     "VectorizedChunk",
     "Vectorizer",
     "execute_document_vectorize",
+    "DocumentOperationRecord",
+    "DocumentOperationStatus",
+    "DocumentProcessingError",
+    "IdempotencyConflictError",
+    "PublicationState",
+    "SQLiteDocumentOperationStore",
+    "DocumentProcessingResult",
+    "DocumentVectorizeConsumer",
+    "DocumentVectorizeProcessor",
+    "build_document_idempotency_key",
+    "build_document_operation_id",
+    "build_document_request_fingerprint",
 ]

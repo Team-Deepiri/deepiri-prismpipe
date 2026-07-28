@@ -1,7 +1,9 @@
 """PrismPipe storage backends."""
 
+import asyncio
 import json
 import os
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -76,34 +78,45 @@ class FileStorage(StorageBackend[T]):
         return self.base_path / f"{safe_key}.json"
 
     async def save(self, key: str, value: T) -> None:
+        await asyncio.to_thread(self._save_sync, key, value)
+
+    def _save_sync(self, key: str, value: T) -> None:
         path = self._get_path(key)
+        temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            with open(path, "w") as f:
-                json.dump(value, f, default=str)
-        except Exception as e:
-            raise StorageError("save", str(e))
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, default=str, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary_path.replace(path)
+        except Exception as error:
+            temporary_path.unlink(missing_ok=True)
+            raise StorageError("save", str(error)) from error
 
     async def load(self, key: str) -> T | None:
+        return await asyncio.to_thread(self._load_sync, key)
+
+    def _load_sync(self, key: str) -> T | None:
         path = self._get_path(key)
         if not path.exists():
             return None
         try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:
-            raise StorageError("load", str(e))
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception as error:
+            raise StorageError("load", str(error)) from error
 
     async def delete(self, key: str) -> None:
-        path = self._get_path(key)
-        if path.exists():
-            path.unlink()
+        await asyncio.to_thread(self._get_path(key).unlink, missing_ok=True)
 
     async def exists(self, key: str) -> bool:
-        return self._get_path(key).exists()
+        return await asyncio.to_thread(self._get_path(key).exists)
 
     async def list_keys(self, prefix: str = "") -> list[str]:
-        prefix_path = self.base_path / f"{prefix}*" if prefix else self.base_path / "*.json"
-        return [p.stem for p in self.base_path.glob(f"{prefix}*.json")]
+        return await asyncio.to_thread(self._list_keys_sync, prefix)
+
+    def _list_keys_sync(self, prefix: str) -> list[str]:
+        return sorted(path.stem for path in self.base_path.glob(f"{prefix}*.json"))
 
 
 class SnapshotStorage(FileStorage[dict[str, Any]]):
