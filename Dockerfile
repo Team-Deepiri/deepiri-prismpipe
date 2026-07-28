@@ -28,6 +28,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 EXPOSE 5011
 
 ENV WEB_CONCURRENCY=1
+# Single worker until ComputationGraph is shared across processes (in-memory dedup).
+# Override via compose/env only after Redis-backed computation sharing lands.
 ENV GUNICORN_TIMEOUT=120
 ENV PORT=5011
 ENV HOST=0.0.0.0
