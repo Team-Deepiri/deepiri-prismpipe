@@ -362,7 +362,7 @@ duplicates, not `organic_api`.
 |------|------|
 | `POST /pipelines/deepiri/session` | **Productivity path:** auth `/auth/verify` ∥ LIS `/health` (one call). Birth-warmed at login. |
 | `GET/POST /pipelines/deepiri/health` | Multi-hop probe: auth∥LIS → cyrex → aggregate |
-| Gateway `/api/prism/pipelines/deepiri/session` | Inline one-RTT fan-out (+ write-through to PrismPipe) |
+| Gateway `/api/prism/pipelines/deepiri/session` | One client RTT: local JWT verify + LIS health (optional `PRISMPIPE_SESSION_WRITE_THROUGH=true`) |
 | Gateway `/api/prism/*` | Proxied when `PRISMPIPE_ENABLED=true` + `PRISMPIPE_URL` |
 | `make prism-gate` | Unit + bench + system regression / usefulness verdict |
 
