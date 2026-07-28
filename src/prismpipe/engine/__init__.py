@@ -9,7 +9,7 @@ import os
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +29,19 @@ from prismpipe.core.envelope import (
 )
 from prismpipe.core.node import Node, NodeResult
 from prismpipe.core.router import CapabilityRouter, NodeNotFoundError
+
+
+def _max_hops() -> int:
+    """Hop ceiling for capability-routed loops.
+
+    Capability routing is cyclic by design (a fault zone re-routes to a heavier
+    producer for another pass), so every routing loop needs a bound or a
+    self-routing capability spins a worker forever.
+    """
+    try:
+        return max(1, int(os.getenv("ORGANISM_MAX_HOPS", "100")))
+    except ValueError:
+        return 100
 
 
 class OrganismState(str, Enum):
@@ -90,7 +103,12 @@ class ComputationGraph:
     ) -> None:
         self._nodes: dict[str, ComputationNode] = {}
         self._hash_to_node: dict[str, str] = {}
-        self._outputs: dict[str, dict[str, Any]] = {}
+        # LRU-ordered. Entries are otherwise only dropped when a lookup happens to
+        # find them expired, so an input nobody queries again is never swept and
+        # the cache grows without bound (one entry per distinct input, forever).
+        self._outputs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._max_entries = max(1, int(os.getenv("COMPUTATION_CACHE_MAX_ENTRIES", "10000")))
+        self._evictions = 0
         self._hits = 0
         self._misses = 0
         self._redis_hits = 0
@@ -181,6 +199,38 @@ class ComputationGraph:
         )
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
+    def _store_output(
+        self,
+        node_id: str,
+        lookup_key: str,
+        state: dict[str, Any],
+        next_capability: str | None,
+        success: bool,
+        expires_at: float | None,
+    ) -> None:
+        """Write an L1 entry as most-recently-used and evict down to the bound.
+
+        `lookup_key` is kept on the entry so eviction can drop the matching
+        `_hash_to_node` / `_nodes` rows too — evicting only `_outputs` would
+        leave the other two dicts growing unbounded.
+        """
+        self._outputs[node_id] = {
+            "state": state,
+            "next": next_capability,
+            "success": success,
+            "expires_at": expires_at,
+            "lookup_key": lookup_key,
+        }
+        self._outputs.move_to_end(node_id)
+
+        while len(self._outputs) > self._max_entries:
+            old_id, old = self._outputs.popitem(last=False)
+            old_key = old.get("lookup_key")
+            if old_key is not None and self._hash_to_node.get(old_key) == old_id:
+                self._hash_to_node.pop(old_key, None)
+            self._nodes.pop(old_id, None)
+            self._evictions += 1
+
     def find_shared_computation(
         self,
         capability: str,
@@ -199,16 +249,32 @@ class ComputationGraph:
     def _hydrate_from_redis(self, capability: str, lookup_key: str) -> CachedComputation | None:
         if self._redis is None:
             return None
+        redis_key = self._redis_key(lookup_key)
         try:
-            raw = self._redis.get(self._redis_key(lookup_key))
+            # GET + TTL in one round trip: the hydrated L1 copy has to inherit the
+            # remaining Redis expiry, or it outlives the TTL it was cached under
+            # and pins a stale result for the life of the worker.
+            pipe = self._redis.pipeline()
+            pipe.get(redis_key)
+            pipe.ttl(redis_key)
+            raw, ttl_remaining = pipe.execute()
         except Exception:
             return None
-        if not raw:
+        if not raw or ttl_remaining == -2:
             return None
         try:
             payload = json.loads(raw)
         except Exception:
             return None
+        if ttl_remaining == -1:
+            expires_at = None  # writer deliberately stored it without an expiry
+        elif isinstance(ttl_remaining, int):
+            expires_at = time.time() + max(0, ttl_remaining)
+        else:
+            # TTL unreadable — fall back to the configured capability TTL. Caching
+            # forever is the one option that must never be the default here.
+            expires_at = time.time() + self.ttl_for(capability)
+
         node_id = payload.get("node_id") or f"comp_redis_{lookup_key[-8:]}"
         node = self._nodes.get(node_id)
         if node is None:
@@ -222,10 +288,14 @@ class ComputationGraph:
             )
             self._nodes[node_id] = node
             self._hash_to_node[lookup_key] = node_id
-        self._outputs[node_id] = {
-            "state": dict(payload.get("state", {})),
-            "next": payload.get("next"),
-        }
+        self._store_output(
+            node_id,
+            lookup_key,
+            dict(payload.get("state", {})),
+            payload.get("next"),
+            bool(payload.get("success", True)),
+            expires_at,
+        )
         node.execution_count += 1
         self._hits += 1
         self._redis_hits += 1
@@ -260,6 +330,7 @@ class ComputationGraph:
                 else:
                     node.execution_count += 1
                     self._hits += 1
+                    self._outputs.move_to_end(node_id)
                     if stored.get("success") is False:
                         self._negative_hits += 1
                     return CachedComputation(
@@ -305,12 +376,14 @@ class ComputationGraph:
                 (existing.avg_latency_ms * (existing.execution_count - 1) + latency_ms)
                 / existing.execution_count
             )
-            self._outputs[existing_id] = {
-                "state": dict(output_data),
-                "next": next_capability,
-                "success": success,
-                "expires_at": expires_at,
-            }
+            self._store_output(
+                existing_id,
+                lookup_key,
+                dict(output_data),
+                next_capability,
+                success,
+                expires_at,
+            )
             if persist_redis and self._redis is not None:
                 self._store_redis(
                     lookup_key,
@@ -336,12 +409,14 @@ class ComputationGraph:
 
         self._nodes[node_id] = node
         self._hash_to_node[lookup_key] = node_id
-        self._outputs[node_id] = {
-            "state": dict(output_data),
-            "next": next_capability,
-            "success": success,
-            "expires_at": expires_at,
-        }
+        self._store_output(
+            node_id,
+            lookup_key,
+            dict(output_data),
+            next_capability,
+            success,
+            expires_at,
+        )
 
         if parent_node_id and parent_node_id in self._nodes:
             self._nodes[parent_node_id].child_ids.append(node_id)
@@ -444,6 +519,9 @@ class ComputationGraph:
             "hit_ratio": self._hits / max(lookups, 1),
             "redis_hits": self._redis_hits,
             "negative_hits": self._negative_hits,
+            "l1_entries": len(self._outputs),
+            "l1_max_entries": self._max_entries,
+            "evictions": self._evictions,
             "redis_enabled": self._redis is not None,
             "ttl_seconds": self._ttl_seconds,
             "negative_ttl_seconds": self._negative_ttl_seconds,
@@ -790,7 +868,14 @@ class TimeSplitter:
     ) -> Organism:
         start_time = time.perf_counter()
 
+        hops = 0
+        max_hops = _max_hops()
         while branch._next_capability and not branch.terminated:
+            hops += 1
+            if hops > max_hops:
+                branch.terminate(f"Max hops ({max_hops}) exceeded in branch execution")
+                break
+
             capability = branch.get_capability()
             if not capability:
                 break
@@ -1355,6 +1440,7 @@ class OrganismExecutor:
         self._router = router
         self._watcher = watcher if watcher is not None else OrganismWatcher()
         self._event_bus = event_bus
+        self._max_hops = _max_hops()
         self._mutations: dict[str, OrganismMutation] = {}
         self._execute_latencies_ms: list[float] = []
         # Single-flight: coalesce concurrent identical cold misses onto one node execute.
@@ -1466,8 +1552,19 @@ class OrganismExecutor:
             parent_id=organism._parent_organism_id,
         )
 
+        hops = 0
         try:
             while organism._next_capability and not organism.terminated:
+                hops += 1
+                if hops > self._max_hops:
+                    organism.terminate(
+                        f"Max hops ({self._max_hops}) exceeded; last capability="
+                        f"{organism.get_capability()!r}. Raise ORGANISM_MAX_HOPS if "
+                        f"this pipeline legitimately needs more passes."
+                    )
+                    envelope.terminate("max hops exceeded")
+                    break
+
                 capability = organism.get_capability()
                 if not capability:
                     break

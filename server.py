@@ -21,11 +21,7 @@ from prismpipe import OrganismPersistence, PrismEngine, create_envelope
 from prismpipe.bench_nodes import BenchComputeNode, BenchPartitionNode
 from prismpipe.core import Intent, Node, NodeResult
 from prismpipe.deepiri_nodes import (
-    SESSION_CAPABILITY,
-    bootstrap_session_async,
-    normalize_authorization,
     register_deepiri_nodes,
-    session_fingerprint,
     warmup_computation_graph,
     warmup_deepiri_http_async,
 )
@@ -426,145 +422,9 @@ async def deepiri_health_pipeline_get():
     return await deepiri_health_pipeline(DeepiriPipelineRequest())
 
 
-class DeepiriSessionRequest(BaseModel):
-    authorization: str | None = None
-    input: dict[str, Any] = Field(default_factory=dict)
-    use_computation_sharing: bool = True
-    # Slim by default — organism/metrics serialization was a cold-path tax.
-    include_organism: bool = False
-    include_metrics: bool = False
-    # Include raw auth_verify / lis_health probe payloads (debug).
-    include_probes: bool = False
-    # Escape hatch to the full organism executor (debug / compatibility).
-    use_organism_executor: bool = False
-
-
-@app.post("/pipelines/deepiri/session")
-async def deepiri_session_pipeline(
-    body: DeepiriSessionRequest | None = None,
-):
-    """Productivity pipeline: auth verify ∥ LIS health in one call.
-
-    Fast path (default): async parallel hops + ComputationGraph cache — skips
-    organism spawn/mutation/watcher so cold latency stays near max(downstream).
-    Pass `authorization: Bearer <jwt>` (or put it under input.authorization).
-    """
-    payload = body or DeepiriSessionRequest()
-    input_data = dict(payload.input or {})
-    if payload.authorization:
-        input_data["authorization"] = payload.authorization
-    authorization = normalize_authorization(
-        str(input_data.get("authorization") or input_data.get("Authorization") or "")
-    )
-
-    if payload.use_organism_executor:
-        organism = engine.spawn_organism(
-            intent="deepiri.session",
-            input_data=input_data,
-            initial_capability=SESSION_CAPABILITY,
-        )
-        result = await engine.execute_organism(
-            organism,
-            use_computation_sharing=payload.use_computation_sharing,
-        )
-        session = result.state.get("session") or result.state.get("result") or {}
-        report = result.state.get("deepiri_report", {})
-        out: dict[str, Any] = {
-            "session": session,
-            "report": report,
-            "useful": bool(session.get("useful") or report.get("useful")),
-            "path": "organism",
-        }
-        if payload.include_organism:
-            out["organism"] = _serialize_organism(result)
-        if payload.include_metrics:
-            out["metrics"] = engine.get_metrics()
-        return out
-
-    fingerprint = session_fingerprint(authorization)
-    graph = engine.computation_graph
-    from_cache = False
-    session: dict[str, Any] | None = None
-
-    if payload.use_computation_sharing:
-        cached = graph.get_cached_result(
-            SESSION_CAPABILITY, fingerprint, use_redis=False
-        )
-        if cached is not None and isinstance(cached.state.get("session"), dict):
-            session = cached.state["session"]
-            from_cache = True
-
-    if session is None:
-        # L1 miss — overlap Redis hydrate with downstream hops.
-        boot_task = asyncio.create_task(bootstrap_session_async(authorization))
-        try:
-            if payload.use_computation_sharing:
-                cached = await asyncio.to_thread(
-                    graph.get_cached_result, SESSION_CAPABILITY, fingerprint
-                )
-                if cached is not None and isinstance(cached.state.get("session"), dict):
-                    session = cached.state["session"]
-                    from_cache = True
-                    boot_task.cancel()
-                    try:
-                        await boot_task
-                    except asyncio.CancelledError:
-                        pass
-            if session is None:
-                session = await boot_task
-                latency_ms = 0.0
-                if payload.use_computation_sharing:
-                    # Sync Redis so birth-warm login is visible to every worker
-                    # before the JWT is returned to the client.
-                    graph.register_computation(
-                        capability=SESSION_CAPABILITY,
-                        input_data=fingerprint,
-                        output_data={"session": session},
-                        latency_ms=latency_ms,
-                        success=bool(session.get("useful")),
-                        next_capability=None,
-                        persist_redis=True,
-                    )
-        except Exception:
-            if not boot_task.done():
-                boot_task.cancel()
-            raise
-
-    report = {
-        "useful": bool(session.get("useful")),
-        "required_ok": bool(session.get("useful")),
-    }
-    if payload.include_probes:
-        report["probes"] = {
-            "auth_verify": session.get("auth_verify"),
-            "lis": session.get("lis_health"),
-        }
-    public_session = {
-        "authenticated": session.get("authenticated"),
-        "user": session.get("user"),
-        "lis_ready": session.get("lis_ready"),
-        "useful": session.get("useful"),
-        "productivity": session.get("productivity"),
-    }
-    if payload.include_probes:
-        public_session["auth_verify"] = session.get("auth_verify")
-        public_session["lis_health"] = session.get("lis_health")
-    out = {
-        "session": public_session,
-        "report": report,
-        "useful": bool(session.get("useful")),
-        "path": "cache" if from_cache else "fast",
-    }
-    if payload.include_organism:
-        out["organism"] = {
-            "id": None,
-            "intent": "deepiri.session",
-            "state": {"session": session},
-            "path": out["path"],
-        }
-    if payload.include_metrics:
-        out["metrics"] = engine.get_metrics()
-    return out
+# PrismPipe's session pipeline (auth.verify + lis.health, cached on the JWT) has
+# been removed: nothing consumed it, and caching an auth decision in a separate
+# service traded a revocation window for ~1ms. See docs/PRISMPIPE_REPURPOSING_PLAN.md.
 
 
 # =============================================================================
