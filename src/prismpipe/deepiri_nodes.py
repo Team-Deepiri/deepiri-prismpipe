@@ -11,6 +11,7 @@ Key productivity pipelines:
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -19,9 +20,31 @@ import httpx
 from prismpipe.core.node import Node, NodeResult
 from prismpipe.engine import PrismEngine
 
+_client_lock = threading.Lock()
+_shared_client: httpx.Client | None = None
+
 
 def _env_url(name: str, default: str) -> str:
     return os.getenv(name, default).rstrip("/")
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide keep-alive client — cuts cold-path TCP/TLS setup to auth/LIS."""
+    global _shared_client
+    if _shared_client is not None:
+        return _shared_client
+    with _client_lock:
+        if _shared_client is None:
+            max_conn = int(os.getenv("DEEPIRI_HTTP_MAX_CONNECTIONS", "32"))
+            max_keep = int(os.getenv("DEEPIRI_HTTP_MAX_KEEPALIVE", "16"))
+            _shared_client = httpx.Client(
+                limits=httpx.Limits(
+                    max_connections=max_conn,
+                    max_keepalive_connections=max_keep,
+                ),
+                http2=False,
+            )
+        return _shared_client
 
 
 def _http_request_json(
@@ -35,19 +58,19 @@ def _http_request_json(
         timeout_s = float(os.getenv("DEEPIRI_PROBE_TIMEOUT_S", "0.8"))
     try:
         timeout = httpx.Timeout(timeout_s, connect=min(0.4, timeout_s))
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.request(method, url, headers=headers or {})
-            body: Any
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text[:500]}
-            return {
-                "ok": 200 <= resp.status_code < 300,
-                "status_code": resp.status_code,
-                "body": body,
-                "url": url,
-            }
+        client = _shared_http_client()
+        resp = client.request(method, url, headers=headers or {}, timeout=timeout)
+        body: Any
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:500]}
+        return {
+            "ok": 200 <= resp.status_code < 300,
+            "status_code": resp.status_code,
+            "body": body,
+            "url": url,
+        }
     except Exception as exc:
         return {
             "ok": False,
@@ -224,6 +247,7 @@ class DeepiriSessionBootstrapNode(Node):
             "productivity": {
                 "client_round_trips_saved": 1,
                 "parallel_hops": ["auth.verify", "lis.health"],
+                "downstream_http_calls": 2,
             },
         }
         envelope.state["session"] = session

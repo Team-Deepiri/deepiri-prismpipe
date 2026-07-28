@@ -94,6 +94,7 @@ class ComputationGraph:
         self._hits = 0
         self._misses = 0
         self._redis_hits = 0
+        self._negative_hits = 0
         self._capability_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "total_latency": 0.0, "failures": 0}
         )
@@ -101,6 +102,22 @@ class ComputationGraph:
         self._ttl_seconds = ttl_seconds
         if ttl_seconds is None:
             self._ttl_seconds = int(os.getenv("COMPUTATION_CACHE_TTL_S", "30"))
+        self._negative_ttl_seconds = int(
+            os.getenv("COMPUTATION_NEGATIVE_TTL_S", "3")
+        )
+        # Per-capability TTLs: short for auth-sensitive, longer for health probes.
+        self._ttl_by_capability: dict[str, int] = {
+            "deepiri.session.bootstrap": int(
+                os.getenv("COMPUTATION_TTL_SESSION_S", "15")
+            ),
+            "deepiri.health.parallel": int(
+                os.getenv("COMPUTATION_TTL_HEALTH_S", "30")
+            ),
+            "deepiri.auth.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.lis.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.aggregate": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.cyrex.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+        }
         self._redis = redis_client
         if self._redis is None and redis_url:
             try:
@@ -114,6 +131,40 @@ class ComputationGraph:
 
     def _redis_key(self, lookup_key: str) -> str:
         return f"{self._redis_prefix}{lookup_key}"
+
+    def _flight_lock_key(self, lookup_key: str) -> str:
+        return f"{self._redis_prefix}sf:{lookup_key}"
+
+    def ttl_for(self, capability: str, *, success: bool = True) -> int:
+        if not success:
+            return max(1, int(self._negative_ttl_seconds))
+        return int(
+            self._ttl_by_capability.get(capability, self._ttl_seconds or 30)
+        )
+
+    def try_acquire_flight_lock(self, lookup_key: str, ttl_s: int = 5) -> bool:
+        """Cross-worker single-flight lock (Redis SET NX). True = caller owns compute."""
+        if self._redis is None:
+            return True
+        try:
+            return bool(
+                self._redis.set(
+                    self._flight_lock_key(lookup_key),
+                    "1",
+                    nx=True,
+                    ex=max(1, int(ttl_s)),
+                )
+            )
+        except Exception:
+            return True
+
+    def release_flight_lock(self, lookup_key: str) -> None:
+        if self._redis is None:
+            return
+        try:
+            self._redis.delete(self._flight_lock_key(lookup_key))
+        except Exception:
+            pass
 
     def compute_input_hash(self, capability: str, input_data: dict[str, Any]) -> str:
         """Hash capability + input for dedup.
@@ -178,6 +229,8 @@ class ComputationGraph:
         node.execution_count += 1
         self._hits += 1
         self._redis_hits += 1
+        if not payload.get("success", True):
+            self._negative_hits += 1
         return CachedComputation(
             node=node,
             state=dict(payload.get("state", {})),
@@ -198,13 +251,20 @@ class ComputationGraph:
             node = self._nodes[node_id]
             stored = self._outputs.get(node_id)
             if stored:
-                node.execution_count += 1
-                self._hits += 1
-                return CachedComputation(
-                    node=node,
-                    state=dict(stored.get("state", {})),
-                    next_capability=stored.get("next"),
-                )
+                expires_at = stored.get("expires_at")
+                if expires_at is not None and time.time() >= float(expires_at):
+                    self._hash_to_node.pop(lookup_key, None)
+                    self._outputs.pop(node_id, None)
+                else:
+                    node.execution_count += 1
+                    self._hits += 1
+                    if stored.get("success") is False:
+                        self._negative_hits += 1
+                    return CachedComputation(
+                        node=node,
+                        state=dict(stored.get("state", {})),
+                        next_capability=stored.get("next"),
+                    )
 
         cached = self._hydrate_from_redis(capability, lookup_key)
         if cached is not None:
@@ -231,6 +291,9 @@ class ComputationGraph:
         node_id = f"comp_{uuid.uuid4().hex[:8]}"
         lookup_key = f"{capability}:{input_hash}"
 
+        ttl = self.ttl_for(capability, success=success)
+        expires_at = time.time() + ttl
+
         if lookup_key in self._hash_to_node:
             existing_id = self._hash_to_node[lookup_key]
             existing = self._nodes[existing_id]
@@ -239,11 +302,23 @@ class ComputationGraph:
                 (existing.avg_latency_ms * (existing.execution_count - 1) + latency_ms)
                 / existing.execution_count
             )
-            if existing_id not in self._outputs:
-                self._outputs[existing_id] = {
-                    "state": dict(output_data),
-                    "next": next_capability,
-                }
+            self._outputs[existing_id] = {
+                "state": dict(output_data),
+                "next": next_capability,
+                "success": success,
+                "expires_at": expires_at,
+            }
+            if self._redis is not None:
+                self._store_redis(
+                    lookup_key,
+                    existing_id,
+                    output_data,
+                    next_capability,
+                    latency_ms,
+                    success,
+                    existing.output_hash or output_hash,
+                    ttl,
+                )
             return existing
 
         node = ComputationNode(
@@ -261,6 +336,8 @@ class ComputationGraph:
         self._outputs[node_id] = {
             "state": dict(output_data),
             "next": next_capability,
+            "success": success,
+            "expires_at": expires_at,
         }
 
         if parent_node_id and parent_node_id in self._nodes:
@@ -272,28 +349,51 @@ class ComputationGraph:
         if not success:
             stats["failures"] += 1
 
-        if self._redis is not None and success:
-            try:
-                payload = json.dumps(
-                    {
-                        "node_id": node_id,
-                        "state": output_data,
-                        "next": next_capability,
-                        "latency_ms": latency_ms,
-                        "success": success,
-                        "output_hash": output_hash,
-                    },
-                    default=str,
-                )
-                key = self._redis_key(lookup_key)
-                if self._ttl_seconds and self._ttl_seconds > 0:
-                    self._redis.set(key, payload, ex=int(self._ttl_seconds))
-                else:
-                    self._redis.set(key, payload)
-            except Exception:
-                pass
+        self._store_redis(
+            lookup_key,
+            node_id,
+            output_data,
+            next_capability,
+            latency_ms,
+            success,
+            output_hash,
+            ttl,
+        )
 
         return node
+
+    def _store_redis(
+        self,
+        lookup_key: str,
+        node_id: str,
+        output_data: dict[str, Any],
+        next_capability: str | None,
+        latency_ms: float,
+        success: bool,
+        output_hash: str,
+        ttl: int,
+    ) -> None:
+        if self._redis is None:
+            return
+        try:
+            payload = json.dumps(
+                {
+                    "node_id": node_id,
+                    "state": output_data,
+                    "next": next_capability,
+                    "latency_ms": latency_ms,
+                    "success": success,
+                    "output_hash": output_hash,
+                },
+                default=str,
+            )
+            key = self._redis_key(lookup_key)
+            if ttl > 0:
+                self._redis.set(key, payload, ex=ttl)
+            else:
+                self._redis.set(key, payload)
+        except Exception:
+            pass
 
     def get_deduplication_stats(self) -> dict[str, Any]:
         total_computations = len(self._nodes)
@@ -308,8 +408,11 @@ class ComputationGraph:
             "misses": self._misses,
             "hit_ratio": self._hits / max(lookups, 1),
             "redis_hits": self._redis_hits,
+            "negative_hits": self._negative_hits,
             "redis_enabled": self._redis is not None,
             "ttl_seconds": self._ttl_seconds,
+            "negative_ttl_seconds": self._negative_ttl_seconds,
+            "ttl_by_capability": dict(self._ttl_by_capability),
             "capability_stats": {
                 cap: {
                     "count": stats["count"],
@@ -1222,6 +1325,12 @@ class OrganismExecutor:
         # Single-flight: coalesce concurrent identical cold misses onto one node execute.
         self._inflight: dict[str, asyncio.Future] = {}
         self._inflight_guard = asyncio.Lock()
+        self._warm_steps = 0
+        self._cold_steps = 0
+        self._single_flight_waits = 0
+        self._useful_true = 0
+        self._useful_false = 0
+        self._downstream_calls_saved = 0
 
     @property
     def watcher(self) -> OrganismWatcher:
@@ -1343,6 +1452,9 @@ class OrganismExecutor:
                     envelope.state = organism.state
                     organism._next_capability = cached.next_capability
                     envelope.next = cached.next_capability
+                    self._warm_steps += 1
+                    # Each warm restore avoids re-running that capability's downstream work.
+                    self._downstream_calls_saved += 1
 
                     if self._event_bus is not None:
                         from prismpipe.events import Event, EventType
@@ -1360,6 +1472,10 @@ class OrganismExecutor:
                         )
                 else:
                     flight_key = self._flight_key(capability, fingerprint)
+                    lookup_key = (
+                        f"{capability}:"
+                        f"{computation_graph.compute_input_hash(capability, fingerprint)}"
+                    )
                     while True:
                         cached = computation_graph.get_cached_result(
                             capability, fingerprint
@@ -1374,13 +1490,44 @@ class OrganismExecutor:
                             envelope.state = organism.state
                             organism._next_capability = cached.next_capability
                             envelope.next = cached.next_capability
+                            self._warm_steps += 1
+                            self._downstream_calls_saved += 1
                             break
 
                         is_owner, fut = await self._await_inflight_or_own(flight_key)
                         if not is_owner and fut is not None:
+                            self._single_flight_waits += 1
                             await fut
                             organism.state["_from_single_flight"] = True
                             continue
+
+                        # Cross-worker lock: if another replica owns compute, wait on Redis.
+                        redis_owner = await asyncio.to_thread(
+                            computation_graph.try_acquire_flight_lock, lookup_key, 5
+                        )
+                        if not redis_owner:
+                            self._single_flight_waits += 1
+                            waited_hit: CachedComputation | None = None
+                            for _ in range(100):
+                                await asyncio.sleep(0.02)
+                                waited_hit = computation_graph.get_cached_result(
+                                    capability, fingerprint
+                                )
+                                if waited_hit is not None:
+                                    break
+                            await self._finish_inflight(flight_key, fut, True)
+                            if waited_hit is not None:
+                                organism.state["_from_single_flight"] = True
+                                continue
+                            # Timed out — try to steal the lock once more.
+                            redis_owner = await asyncio.to_thread(
+                                computation_graph.try_acquire_flight_lock,
+                                lookup_key,
+                                5,
+                            )
+                            if not redis_owner:
+                                # Still locked; compute without claiming release duty.
+                                pass
 
                         try:
                             node = self._router.resolve(capability)
@@ -1402,6 +1549,7 @@ class OrganismExecutor:
                                 success=success,
                                 next_capability=envelope.next,
                             )
+                            self._cold_steps += 1
                             await self._finish_inflight(flight_key, fut, True)
 
                             if self._event_bus is not None:
@@ -1429,6 +1577,11 @@ class OrganismExecutor:
                                     request_id=organism.id,
                                 )
                             break
+                        finally:
+                            if redis_owner:
+                                await asyncio.to_thread(
+                                    computation_graph.release_flight_lock, lookup_key
+                                )
 
                     if organism.terminated:
                         break
@@ -1437,6 +1590,21 @@ class OrganismExecutor:
                     mutation, capability, before_state, organism.state
                 )
                 self._watcher.notify(organism, "node_executed")
+
+            # Track usefulness when pipelines publish deepiri_report/session.
+            report = organism.state.get("deepiri_report") or organism.state.get("session")
+            if isinstance(report, dict) and "useful" in report:
+                if report.get("useful"):
+                    self._useful_true += 1
+                else:
+                    self._useful_false += 1
+                saved = (
+                    (report.get("productivity") or {}).get("client_round_trips_saved")
+                    if isinstance(report.get("productivity"), dict)
+                    else None
+                )
+                if isinstance(saved, int) and organism.state.get("_from_shared"):
+                    self._downstream_calls_saved += max(0, saved)
 
             duration_ms = (time.perf_counter() - start_time) * 1000
             self._execute_latencies_ms.append(duration_ms)
@@ -1486,6 +1654,20 @@ class OrganismExecutor:
             "p95": percentile(0.95),
             "p99": percentile(0.99),
             "avg": sum(values) / n,
+        }
+
+    def get_usefulness_stats(self) -> dict[str, Any]:
+        steps = self._warm_steps + self._cold_steps
+        useful_n = self._useful_true + self._useful_false
+        return {
+            "warm_steps": self._warm_steps,
+            "cold_steps": self._cold_steps,
+            "warm_rate": self._warm_steps / max(steps, 1),
+            "single_flight_waits": self._single_flight_waits,
+            "useful_true": self._useful_true,
+            "useful_false": self._useful_false,
+            "useful_rate": self._useful_true / max(useful_n, 1),
+            "downstream_calls_saved": self._downstream_calls_saved,
         }
 
 
@@ -2227,6 +2409,7 @@ class PrismEngine:
     def get_metrics(self) -> dict[str, Any]:
         dedup = self.computation_graph.get_deduplication_stats()
         latency = self.organism_executor.get_execute_latency_stats()
+        useful = self.organism_executor.get_usefulness_stats()
         swarm = self.swarm_coordinator.get_last_swarm_stats()
         return {
             "hit_ratio": dedup.get("hit_ratio", 0.0),
@@ -2236,10 +2419,19 @@ class PrismEngine:
             "unique_computations": dedup.get("unique_computations", 0),
             "redis_enabled": dedup.get("redis_enabled", False),
             "redis_hits": dedup.get("redis_hits", 0),
+            "negative_hits": dedup.get("negative_hits", 0),
             "cache_ttl_seconds": dedup.get("ttl_seconds"),
+            "negative_ttl_seconds": dedup.get("negative_ttl_seconds"),
+            "ttl_by_capability": dedup.get("ttl_by_capability", {}),
             "execute_p95": latency.get("p95", 0.0),
             "execute_p99": latency.get("p99", 0.0),
             "execute_count": self._execute_count,
+            "warm_steps": useful.get("warm_steps", 0),
+            "cold_steps": useful.get("cold_steps", 0),
+            "warm_rate": useful.get("warm_rate", 0.0),
+            "single_flight_waits": useful.get("single_flight_waits", 0),
+            "useful_rate": useful.get("useful_rate", 0.0),
+            "downstream_calls_saved": useful.get("downstream_calls_saved", 0),
             "swarm_worker_count": swarm.get("worker_count", 0),
             "swarm_error_rate": swarm.get("error_rate", 0.0),
             "organism_count": len(self.organism_registry._organisms),

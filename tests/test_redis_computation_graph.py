@@ -34,9 +34,21 @@ class FakeRedis:
     def get(self, key: str):
         return self.store.get(key)
 
-    def set(self, key: str, value: str, ex: int | None = None):
+    def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ):
+        if nx and key in self.store:
+            return False
         self.store[key] = value
         return True
+
+    def delete(self, key: str):
+        self.store.pop(key, None)
+        return 1
 
 
 def test_redis_backed_graph_shares_across_instances():
@@ -79,3 +91,37 @@ async def test_single_flight_coalesces_concurrent_misses():
     # Only one real node execute; waiters reuse via cache/single-flight
     assert SlowCountingNode.call_count == 1
     assert any(r[1] for r in results)
+
+
+def test_negative_cache_uses_short_ttl(monkeypatch):
+    monkeypatch.setenv("COMPUTATION_NEGATIVE_TTL_S", "2")
+    g = ComputationGraph(ttl_seconds=30)
+    assert g.ttl_for("deepiri.session.bootstrap", success=False) == 2
+    assert g.ttl_for("deepiri.health.parallel", success=True) == 30
+
+
+def test_l1_cache_expires(monkeypatch):
+    monkeypatch.setenv("COMPUTATION_NEGATIVE_TTL_S", "1")
+    g = ComputationGraph(ttl_seconds=30)
+    g.register_computation(
+        capability="x",
+        input_data={"a": 1},
+        output_data={"out": "fail"},
+        latency_ms=1.0,
+        success=False,
+        next_capability=None,
+    )
+    assert g.get_cached_result("x", {"a": 1}) is not None
+    # Force expiry without sleeping the full TTL.
+    node_id = next(iter(g._outputs))
+    g._outputs[node_id]["expires_at"] = 0
+    assert g.get_cached_result("x", {"a": 1}) is None
+
+
+def test_flight_lock_nx(monkeypatch):
+    redis = FakeRedis()
+    g = ComputationGraph(redis_client=redis, ttl_seconds=30)
+    assert g.try_acquire_flight_lock("cap:hash", 5) is True
+    assert g.try_acquire_flight_lock("cap:hash", 5) is False
+    g.release_flight_lock("cap:hash")
+    assert g.try_acquire_flight_lock("cap:hash", 5) is True
