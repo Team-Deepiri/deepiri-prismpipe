@@ -1,9 +1,4 @@
-gunicorn
-fastapi>=0.110
-uvicorn[standard]>=0.27
-pydantic>=2
-httpx>=0.27
-structlog>=24
-orjson>=3.10
-redis>=5
-asyncpg>=0.29
+# Thin Docker bootstrap only — full deps come from pyproject extras:
+#   pip install -e ".[all]"
+# Keep this file free of duplicated package pins (Sorge / Poetry source of truth).
+gunicorn>=22

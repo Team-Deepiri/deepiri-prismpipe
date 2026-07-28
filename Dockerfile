@@ -22,7 +22,6 @@ COPY server.py .
 
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -e ".[all]" \
-    && pip install --no-cache-dir "fastapi>=0.110" "uvicorn[standard]>=0.27" "gunicorn>=22" \
     && bedd help >/dev/null
 
 EXPOSE 5011
