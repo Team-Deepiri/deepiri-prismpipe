@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -76,20 +77,43 @@ class CachedComputation:
 class ComputationGraph:
     """Shared computation deduplication - compute once, reuse forever.
 
-    TODO(distributed-cache): back this graph with Redis (or equivalent) so
-    WEB_CONCURRENCY / multi-replica deployments share hits. Until then keep a
-    single process worker so warm pipelines stay correct.
+    Optional Redis backing (`redis_url`) shares hits across gunicorn workers /
+    replicas. Local memory remains an L1 cache; Redis is L2 with TTL.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        redis_url: str | None = None,
+        redis_prefix: str = "prismpipe:cg:",
+        ttl_seconds: int | None = None,
+        redis_client: Any | None = None,
+    ) -> None:
         self._nodes: dict[str, ComputationNode] = {}
         self._hash_to_node: dict[str, str] = {}
         self._outputs: dict[str, dict[str, Any]] = {}
         self._hits = 0
         self._misses = 0
+        self._redis_hits = 0
         self._capability_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "total_latency": 0.0, "failures": 0}
         )
+        self._redis_prefix = redis_prefix
+        self._ttl_seconds = ttl_seconds
+        if ttl_seconds is None:
+            self._ttl_seconds = int(os.getenv("COMPUTATION_CACHE_TTL_S", "30"))
+        self._redis = redis_client
+        if self._redis is None and redis_url:
+            try:
+                import redis as redis_sync
+
+                self._redis = redis_sync.from_url(redis_url, decode_responses=True)
+                self._redis.ping()
+            except Exception:
+                # Fall back to in-process only — never fail engine startup on Redis.
+                self._redis = None
+
+    def _redis_key(self, lookup_key: str) -> str:
+        return f"{self._redis_prefix}{lookup_key}"
 
     def compute_input_hash(self, capability: str, input_data: dict[str, Any]) -> str:
         """Hash capability + input for dedup.
@@ -121,6 +145,45 @@ class ComputationGraph:
             return node
         return None
 
+    def _hydrate_from_redis(self, capability: str, lookup_key: str) -> CachedComputation | None:
+        if self._redis is None:
+            return None
+        try:
+            raw = self._redis.get(self._redis_key(lookup_key))
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        node_id = payload.get("node_id") or f"comp_redis_{lookup_key[-8:]}"
+        node = self._nodes.get(node_id)
+        if node is None:
+            node = ComputationNode(
+                id=node_id,
+                capability=capability,
+                input_hash=lookup_key.split(":", 1)[-1],
+                output_hash=str(payload.get("output_hash", ""))[:16],
+                avg_latency_ms=float(payload.get("latency_ms", 0.0)),
+                success_rate=1.0 if payload.get("success", True) else 0.0,
+            )
+            self._nodes[node_id] = node
+            self._hash_to_node[lookup_key] = node_id
+        self._outputs[node_id] = {
+            "state": dict(payload.get("state", {})),
+            "next": payload.get("next"),
+        }
+        node.execution_count += 1
+        self._hits += 1
+        self._redis_hits += 1
+        return CachedComputation(
+            node=node,
+            state=dict(payload.get("state", {})),
+            next_capability=payload.get("next"),
+        )
+
     def get_cached_result(
         self,
         capability: str,
@@ -130,24 +193,25 @@ class ComputationGraph:
         input_hash = self.compute_input_hash(capability, input_data)
         lookup_key = f"{capability}:{input_hash}"
 
-        if lookup_key not in self._hash_to_node:
-            self._misses += 1
-            return None
+        if lookup_key in self._hash_to_node:
+            node_id = self._hash_to_node[lookup_key]
+            node = self._nodes[node_id]
+            stored = self._outputs.get(node_id)
+            if stored:
+                node.execution_count += 1
+                self._hits += 1
+                return CachedComputation(
+                    node=node,
+                    state=dict(stored.get("state", {})),
+                    next_capability=stored.get("next"),
+                )
 
-        node_id = self._hash_to_node[lookup_key]
-        node = self._nodes[node_id]
-        stored = self._outputs.get(node_id)
-        if not stored:
-            self._misses += 1
-            return None
+        cached = self._hydrate_from_redis(capability, lookup_key)
+        if cached is not None:
+            return cached
 
-        node.execution_count += 1
-        self._hits += 1
-        return CachedComputation(
-            node=node,
-            state=dict(stored.get("state", {})),
-            next_capability=stored.get("next"),
-        )
+        self._misses += 1
+        return None
 
     def register_computation(
         self,
@@ -208,6 +272,27 @@ class ComputationGraph:
         if not success:
             stats["failures"] += 1
 
+        if self._redis is not None and success:
+            try:
+                payload = json.dumps(
+                    {
+                        "node_id": node_id,
+                        "state": output_data,
+                        "next": next_capability,
+                        "latency_ms": latency_ms,
+                        "success": success,
+                        "output_hash": output_hash,
+                    },
+                    default=str,
+                )
+                key = self._redis_key(lookup_key)
+                if self._ttl_seconds and self._ttl_seconds > 0:
+                    self._redis.set(key, payload, ex=int(self._ttl_seconds))
+                else:
+                    self._redis.set(key, payload)
+            except Exception:
+                pass
+
         return node
 
     def get_deduplication_stats(self) -> dict[str, Any]:
@@ -222,6 +307,9 @@ class ComputationGraph:
             "hits": self._hits,
             "misses": self._misses,
             "hit_ratio": self._hits / max(lookups, 1),
+            "redis_hits": self._redis_hits,
+            "redis_enabled": self._redis is not None,
+            "ttl_seconds": self._ttl_seconds,
             "capability_stats": {
                 cap: {
                     "count": stats["count"],
@@ -1131,6 +1219,9 @@ class OrganismExecutor:
         self._event_bus = event_bus
         self._mutations: dict[str, OrganismMutation] = {}
         self._execute_latencies_ms: list[float] = []
+        # Single-flight: coalesce concurrent identical cold misses onto one node execute.
+        self._inflight: dict[str, asyncio.Future] = {}
+        self._inflight_guard = asyncio.Lock()
 
     @property
     def watcher(self) -> OrganismWatcher:
@@ -1151,6 +1242,31 @@ class OrganismExecutor:
     @staticmethod
     def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in state.items() if not str(k).startswith("_")}
+
+    def _flight_key(self, capability: str, fingerprint: dict[str, Any]) -> str:
+        return f"{capability}:{json.dumps(fingerprint, sort_keys=True, default=str)}"
+
+    async def _await_inflight_or_own(
+        self, key: str
+    ) -> tuple[bool, asyncio.Future | None]:
+        """Return (is_owner, future). Owner must complete and set_result; waiters await."""
+        async with self._inflight_guard:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                return False, existing
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._inflight[key] = fut
+            return True, fut
+
+    async def _finish_inflight(self, key: str, fut: asyncio.Future | None, ok: bool) -> None:
+        if fut is None:
+            return
+        if not fut.done():
+            fut.set_result(ok)
+        async with self._inflight_guard:
+            if self._inflight.get(key) is fut:
+                self._inflight.pop(key, None)
 
     def _record_mutations(
         self,
@@ -1243,48 +1359,78 @@ class OrganismExecutor:
                             )
                         )
                 else:
-                    try:
-                        node = self._router.resolve(capability)
-                        # Nodes may do blocking HTTP/CPU work; never block the event loop.
-                        result = await asyncio.to_thread(node.execute, envelope)
-
-                        envelope = result.envelope
-                        organism.state = dict(envelope.state)
-                        organism.history = list(envelope.history)
-                        organism._next_capability = envelope.next
-
-                        latency = (time.perf_counter() - step_start) * 1000
-                        success = result.success and not envelope.terminated
-
-                        computation_graph.register_computation(
-                            capability=capability,
-                            input_data=fingerprint,
-                            output_data=self._public_state(organism.state),
-                            latency_ms=latency,
-                            success=success,
-                            next_capability=envelope.next,
+                    flight_key = self._flight_key(capability, fingerprint)
+                    while True:
+                        cached = computation_graph.get_cached_result(
+                            capability, fingerprint
                         )
+                        if cached is not None:
+                            for key, value in cached.state.items():
+                                if not str(key).startswith("_"):
+                                    organism.state[key] = value
+                            organism.state["_from_shared"] = True
+                            organism.state["_shared_node_id"] = cached.node.id
+                            organism._computation_node_id = cached.node.id
+                            envelope.state = organism.state
+                            organism._next_capability = cached.next_capability
+                            envelope.next = cached.next_capability
+                            break
 
-                        if self._event_bus is not None:
-                            await self._event_bus.emit_node_executed(
+                        is_owner, fut = await self._await_inflight_or_own(flight_key)
+                        if not is_owner and fut is not None:
+                            await fut
+                            organism.state["_from_single_flight"] = True
+                            continue
+
+                        try:
+                            node = self._router.resolve(capability)
+                            result = await asyncio.to_thread(node.execute, envelope)
+
+                            envelope = result.envelope
+                            organism.state = dict(envelope.state)
+                            organism.history = list(envelope.history)
+                            organism._next_capability = envelope.next
+
+                            latency = (time.perf_counter() - step_start) * 1000
+                            success = result.success and not envelope.terminated
+
+                            computation_graph.register_computation(
                                 capability=capability,
+                                input_data=fingerprint,
+                                output_data=self._public_state(organism.state),
                                 latency_ms=latency,
                                 success=success,
-                                request_id=organism.id,
+                                next_capability=envelope.next,
                             )
+                            await self._finish_inflight(flight_key, fut, True)
 
-                        if not success:
-                            organism.terminate(result.error or envelope.error or "node failed")
+                            if self._event_bus is not None:
+                                await self._event_bus.emit_node_executed(
+                                    capability=capability,
+                                    latency_ms=latency,
+                                    success=success,
+                                    request_id=organism.id,
+                                )
+
+                            if not success:
+                                organism.terminate(
+                                    result.error or envelope.error or "node failed"
+                                )
                             break
-                    except Exception as e:
-                        organism.terminate(str(e))
-                        if self._event_bus is not None:
-                            await self._event_bus.emit_node_executed(
-                                capability=capability,
-                                latency_ms=(time.perf_counter() - step_start) * 1000,
-                                success=False,
-                                request_id=organism.id,
-                            )
+                        except Exception as e:
+                            await self._finish_inflight(flight_key, fut, False)
+                            organism.terminate(str(e))
+                            if self._event_bus is not None:
+                                await self._event_bus.emit_node_executed(
+                                    capability=capability,
+                                    latency_ms=(time.perf_counter() - step_start)
+                                    * 1000,
+                                    success=False,
+                                    request_id=organism.id,
+                                )
+                            break
+
+                    if organism.terminated:
                         break
 
                 self._record_mutations(
@@ -1891,7 +2037,11 @@ class RequestMemory:
 class PrismEngine:
     """The complete PrismPipe execution engine with organic request processing."""
 
-    def __init__(self, event_bus: Any | None = None) -> None:
+    def __init__(
+        self,
+        event_bus: Any | None = None,
+        computation_redis_url: str | None = None,
+    ) -> None:
         self.router = CapabilityRouter()
         self.replay_engine = ReplayEngine()
         self.diff_engine = DiffEngine()
@@ -1903,7 +2053,10 @@ class PrismEngine:
         self.ancestry_tree = AncestryTree()
         self.semantic_cache = SemanticCache()
 
-        self.computation_graph = ComputationGraph()
+        redis_url = computation_redis_url
+        if redis_url is None:
+            redis_url = os.getenv("COMPUTATION_REDIS_URL") or os.getenv("REDIS_URL")
+        self.computation_graph = ComputationGraph(redis_url=redis_url)
         self.organism_registry = OrganismRegistry()
         self.pipeline_evolver = PipelineEvolver()
         self.intent_planner = IntentPlanner(self.router)
@@ -2081,6 +2234,9 @@ class PrismEngine:
             "hits": dedup.get("hits", 0),
             "misses": dedup.get("misses", 0),
             "unique_computations": dedup.get("unique_computations", 0),
+            "redis_enabled": dedup.get("redis_enabled", False),
+            "redis_hits": dedup.get("redis_hits", 0),
+            "cache_ttl_seconds": dedup.get("ttl_seconds"),
             "execute_p95": latency.get("p95", 0.0),
             "execute_p99": latency.get("p99", 0.0),
             "execute_count": self._execute_count,

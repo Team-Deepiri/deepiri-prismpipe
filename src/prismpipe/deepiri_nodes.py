@@ -2,11 +2,16 @@
 
 These nodes make PrismPipe useful as a capability-routed façade over auth, LIS,
 and Cyrex rather than demo stubs.
+
+Key productivity pipelines:
+  - deepiri.health.parallel — auth+LIS health in parallel (cold ≈ max hop, not sum)
+  - deepiri.session.bootstrap — auth /auth/verify + LIS /health in one call
 """
 
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -19,13 +24,19 @@ def _env_url(name: str, default: str) -> str:
     return os.getenv(name, default).rstrip("/")
 
 
-def _http_get_json(url: str, timeout_s: float | None = None) -> dict[str, Any]:
+def _http_request_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
     if timeout_s is None:
         timeout_s = float(os.getenv("DEEPIRI_PROBE_TIMEOUT_S", "0.8"))
     try:
         timeout = httpx.Timeout(timeout_s, connect=min(0.4, timeout_s))
         with httpx.Client(timeout=timeout) as client:
-            resp = client.get(url)
+            resp = client.request(method, url, headers=headers or {})
             body: Any
             try:
                 body = resp.json()
@@ -46,8 +57,12 @@ def _http_get_json(url: str, timeout_s: float | None = None) -> dict[str, Any]:
         }
 
 
+def _http_get_json(url: str, timeout_s: float | None = None) -> dict[str, Any]:
+    return _http_request_json("GET", url, timeout_s=timeout_s)
+
+
 class DeepiriAuthHealthNode(Node):
-    """Probe auth-service /health."""
+    """Probe auth-service /health (sequential chain compatibility)."""
 
     capability = "deepiri.auth.health"
 
@@ -71,6 +86,26 @@ class DeepiriLisHealthNode(Node):
         )
         result = _http_get_json(f"{base}/health")
         envelope.state["lis_health"] = result
+        envelope.set_next("deepiri.cyrex.health")
+        return NodeResult(envelope=envelope, success=True)
+
+
+class DeepiriParallelHealthNode(Node):
+    """Auth + LIS health in parallel — cold path ≈ slowest hop, not sum."""
+
+    capability = "deepiri.health.parallel"
+
+    def process(self, envelope):
+        auth_base = _env_url("AUTH_SERVICE_URL", "http://auth-service:5001")
+        lis_base = _env_url(
+            "LANGUAGE_INTELLIGENCE_SERVICE_URL",
+            "http://language-intelligence-service:5003",
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            auth_f = pool.submit(_http_get_json, f"{auth_base}/health")
+            lis_f = pool.submit(_http_get_json, f"{lis_base}/health")
+            envelope.state["auth_health"] = auth_f.result()
+            envelope.state["lis_health"] = lis_f.result()
         envelope.set_next("deepiri.cyrex.health")
         return NodeResult(envelope=envelope, success=True)
 
@@ -128,18 +163,94 @@ class DeepiriAggregateNode(Node):
         return NodeResult(envelope=envelope, success=True)
 
 
+class DeepiriSessionBootstrapNode(Node):
+    """One-call session bootstrap: auth verify + LIS readiness in parallel.
+
+    Replaces two client round-trips (gateway→auth verify, gateway→LIS health)
+    with a single PrismPipe call. Identical Authorization inputs share computation
+    (short Redis TTL) so bursts add near-zero auth load.
+    """
+
+    capability = "deepiri.session.bootstrap"
+
+    def process(self, envelope):
+        auth_base = _env_url("AUTH_SERVICE_URL", "http://auth-service:5001")
+        lis_base = _env_url(
+            "LANGUAGE_INTELLIGENCE_SERVICE_URL",
+            "http://language-intelligence-service:5003",
+        )
+        authorization = (
+            envelope.input.get("authorization")
+            or envelope.input.get("Authorization")
+            or ""
+        )
+        if authorization and not str(authorization).lower().startswith("bearer "):
+            authorization = f"Bearer {authorization}"
+
+        def _verify() -> dict[str, Any]:
+            if not authorization:
+                return {
+                    "ok": False,
+                    "status_code": 401,
+                    "body": {"error": "authorization required"},
+                    "url": f"{auth_base}/auth/verify",
+                }
+            return _http_request_json(
+                "GET",
+                f"{auth_base}/auth/verify",
+                headers={"Authorization": str(authorization)},
+                timeout_s=float(os.getenv("DEEPIRI_AUTH_VERIFY_TIMEOUT_S", "1.5")),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            verify_f = pool.submit(_verify)
+            lis_f = pool.submit(_http_get_json, f"{lis_base}/health")
+            auth_verify = verify_f.result()
+            lis_health = lis_f.result()
+
+        user = None
+        if auth_verify.get("ok") and isinstance(auth_verify.get("body"), dict):
+            user = auth_verify["body"].get("user") or auth_verify["body"]
+
+        useful = bool(auth_verify.get("ok")) and bool(lis_health.get("ok"))
+        session = {
+            "authenticated": bool(auth_verify.get("ok")),
+            "user": user,
+            "lis_ready": bool(lis_health.get("ok")),
+            "auth_verify": auth_verify,
+            "lis_health": lis_health,
+            "useful": useful,
+            # Client saved one RTT vs calling auth+LIS separately.
+            "productivity": {
+                "client_round_trips_saved": 1,
+                "parallel_hops": ["auth.verify", "lis.health"],
+            },
+        }
+        envelope.state["session"] = session
+        envelope.state["result"] = session
+        envelope.state["deepiri_report"] = {
+            "useful": useful,
+            "required_ok": useful,
+            "probes": {"auth_verify": auth_verify, "lis": lis_health},
+        }
+        envelope.set_next(None)
+        return NodeResult(envelope=envelope, success=True)
+
+
 def register_deepiri_nodes(engine: PrismEngine) -> PrismEngine:
     """Register Deepiri platform nodes on a PrismEngine."""
     for node in (
         DeepiriAuthHealthNode(),
         DeepiriLisHealthNode(),
+        DeepiriParallelHealthNode(),
         DeepiriCyrexHealthNode(),
         DeepiriAggregateNode(),
+        DeepiriSessionBootstrapNode(),
     ):
         engine.register_node(node)
         engine.intent_planner.register_capability(
             node.capability,
             node.description or node.capability,
-            keywords=["deepiri", "health", "auth", "lis", "cyrex"],
+            keywords=["deepiri", "health", "auth", "lis", "cyrex", "session"],
         )
     return engine

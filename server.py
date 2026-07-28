@@ -379,7 +379,7 @@ class DeepiriPipelineRequest(BaseModel):
 
 @app.post("/pipelines/deepiri/health")
 async def deepiri_health_pipeline(body: DeepiriPipelineRequest | None = None):
-    """Multi-hop Deepiri probe: auth → LIS → cyrex → aggregate.
+    """Multi-hop Deepiri probe: auth∥LIS → cyrex → aggregate.
 
     Identical requests share computation via ComputationGraph — this is the
     primary usefulness signal for platform wiring.
@@ -388,7 +388,7 @@ async def deepiri_health_pipeline(body: DeepiriPipelineRequest | None = None):
     organism = engine.spawn_organism(
         intent="deepiri.health",
         input_data=payload.input or {"probe": "health"},
-        initial_capability="deepiri.auth.health",
+        initial_capability="deepiri.health.parallel",
     )
     result = await engine.execute_organism(
         organism,
@@ -406,6 +406,44 @@ async def deepiri_health_pipeline(body: DeepiriPipelineRequest | None = None):
 @app.get("/pipelines/deepiri/health")
 async def deepiri_health_pipeline_get():
     return await deepiri_health_pipeline(DeepiriPipelineRequest())
+
+
+class DeepiriSessionRequest(BaseModel):
+    authorization: str | None = None
+    input: dict[str, Any] = Field(default_factory=dict)
+    use_computation_sharing: bool = True
+
+
+@app.post("/pipelines/deepiri/session")
+async def deepiri_session_pipeline(body: DeepiriSessionRequest | None = None):
+    """Productivity pipeline: auth verify ∥ LIS health in one call.
+
+    Pass `authorization: Bearer <jwt>` (or put it under input.authorization).
+    Warm identical tokens are served from the shared computation cache (Redis
+    when configured) so repeated session checks add near-zero auth load.
+    """
+    payload = body or DeepiriSessionRequest()
+    input_data = dict(payload.input or {})
+    if payload.authorization:
+        input_data["authorization"] = payload.authorization
+    organism = engine.spawn_organism(
+        intent="deepiri.session",
+        input_data=input_data,
+        initial_capability="deepiri.session.bootstrap",
+    )
+    result = await engine.execute_organism(
+        organism,
+        use_computation_sharing=payload.use_computation_sharing,
+    )
+    session = result.state.get("session") or result.state.get("result") or {}
+    report = result.state.get("deepiri_report", {})
+    return {
+        "organism": _serialize_organism(result),
+        "session": session,
+        "report": report,
+        "useful": bool(session.get("useful") or report.get("useful")),
+        "metrics": engine.get_metrics(),
+    }
 
 
 # =============================================================================

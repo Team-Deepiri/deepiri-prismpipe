@@ -76,6 +76,8 @@ def test_deepiri_pipeline_endpoint_registered(client):
     caps = client.get("/engine/capabilities").json()["capabilities"]
     assert "deepiri.auth.health" in caps
     assert "deepiri.aggregate" in caps
+    assert "deepiri.session.bootstrap" in caps
+    assert "deepiri.health.parallel" in caps
 
     from unittest.mock import patch
 
