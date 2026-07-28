@@ -64,12 +64,24 @@ class ComputationNode:
     parent_id: str | None = None
 
 
+@dataclass
+class CachedComputation:
+    """Materialized shared computation ready to restore into an organism."""
+
+    node: ComputationNode
+    state: dict[str, Any]
+    next_capability: str | None = None
+
+
 class ComputationGraph:
     """Shared computation deduplication - compute once, reuse forever."""
 
     def __init__(self) -> None:
         self._nodes: dict[str, ComputationNode] = {}
         self._hash_to_node: dict[str, str] = {}
+        self._outputs: dict[str, dict[str, Any]] = {}
+        self._hits = 0
+        self._misses = 0
         self._capability_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "total_latency": 0.0, "failures": 0}
         )
@@ -89,13 +101,41 @@ class ComputationGraph:
     ) -> ComputationNode | None:
         input_hash = self.compute_input_hash(capability, input_data)
         lookup_key = f"{capability}:{input_hash}"
-        
+
         if lookup_key in self._hash_to_node:
             node_id = self._hash_to_node[lookup_key]
             node = self._nodes[node_id]
             node.execution_count += 1
             return node
         return None
+
+    def get_cached_result(
+        self,
+        capability: str,
+        input_data: dict[str, Any],
+    ) -> CachedComputation | None:
+        """Lookup shared computation and return restorable outputs on hit."""
+        input_hash = self.compute_input_hash(capability, input_data)
+        lookup_key = f"{capability}:{input_hash}"
+
+        if lookup_key not in self._hash_to_node:
+            self._misses += 1
+            return None
+
+        node_id = self._hash_to_node[lookup_key]
+        node = self._nodes[node_id]
+        stored = self._outputs.get(node_id)
+        if not stored:
+            self._misses += 1
+            return None
+
+        node.execution_count += 1
+        self._hits += 1
+        return CachedComputation(
+            node=node,
+            state=dict(stored.get("state", {})),
+            next_capability=stored.get("next"),
+        )
 
     def register_computation(
         self,
@@ -105,15 +145,16 @@ class ComputationGraph:
         latency_ms: float,
         success: bool,
         parent_node_id: str | None = None,
+        next_capability: str | None = None,
     ) -> ComputationNode:
         input_hash = self.compute_input_hash(capability, input_data)
         output_hash = hashlib.sha256(
             json.dumps(output_data, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
-        
+
         node_id = f"comp_{uuid.uuid4().hex[:8]}"
         lookup_key = f"{capability}:{input_hash}"
-        
+
         if lookup_key in self._hash_to_node:
             existing_id = self._hash_to_node[lookup_key]
             existing = self._nodes[existing_id]
@@ -122,8 +163,13 @@ class ComputationGraph:
                 (existing.avg_latency_ms * (existing.execution_count - 1) + latency_ms)
                 / existing.execution_count
             )
+            if existing_id not in self._outputs:
+                self._outputs[existing_id] = {
+                    "state": dict(output_data),
+                    "next": next_capability,
+                }
             return existing
-        
+
         node = ComputationNode(
             id=node_id,
             capability=capability,
@@ -133,29 +179,37 @@ class ComputationGraph:
             success_rate=1.0 if success else 0.0,
             parent_id=parent_node_id,
         )
-        
+
         self._nodes[node_id] = node
         self._hash_to_node[lookup_key] = node_id
-        
+        self._outputs[node_id] = {
+            "state": dict(output_data),
+            "next": next_capability,
+        }
+
         if parent_node_id and parent_node_id in self._nodes:
             self._nodes[parent_node_id].child_ids.append(node_id)
-        
+
         stats = self._capability_stats[capability]
         stats["count"] += 1
         stats["total_latency"] += latency_ms
         if not success:
             stats["failures"] += 1
-        
+
         return node
 
     def get_deduplication_stats(self) -> dict[str, Any]:
         total_computations = len(self._nodes)
         total_reuses = sum(n.execution_count - 1 for n in self._nodes.values())
-        
+        lookups = self._hits + self._misses
+
         return {
             "unique_computations": total_computations,
             "total_reuses": total_reuses,
             "deduplication_ratio": total_reuses / max(total_computations, 1),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_ratio": self._hits / max(lookups, 1),
             "capability_stats": {
                 cap: {
                     "count": stats["count"],
@@ -460,10 +514,15 @@ class TimeSplitter:
           result ← wins
     """
 
-    def __init__(self, router: CapabilityRouter) -> None:
+    def __init__(
+        self,
+        router: CapabilityRouter,
+        max_branches: int = 4,
+        timeout_ms: int = 5000,
+    ) -> None:
         self._router = router
-        self._max_branches = 4
-        self._timeout_ms = 5000
+        self._max_branches = max_branches
+        self._timeout_ms = timeout_ms
 
     def split(
         self,
@@ -478,48 +537,69 @@ class TimeSplitter:
             branches.append(branch)
         return branches
 
+    def _fingerprint(self, organism: Organism) -> dict[str, Any]:
+        return {
+            "input": organism.input,
+            "state": {
+                k: v for k, v in organism.state.items() if not str(k).startswith("_")
+            },
+        }
+
     async def execute_branch(
         self,
         branch: Organism,
         computation_graph: ComputationGraph,
     ) -> Organism:
         start_time = time.perf_counter()
-        
+
         while branch._next_capability and not branch.terminated:
             capability = branch.get_capability()
             if not capability:
                 break
-                
-            shared = computation_graph.find_shared_computation(
-                capability,
-                branch.input,
-            )
-            
-            if shared:
+
+            fingerprint = self._fingerprint(branch)
+            cached = computation_graph.get_cached_result(capability, fingerprint)
+
+            if cached:
+                for key, value in cached.state.items():
+                    if not str(key).startswith("_"):
+                        branch.state[key] = value
                 branch.state["_from_shared"] = True
-                branch.state["_shared_node_id"] = shared.id
+                branch.state["_shared_node_id"] = cached.node.id
+                branch._next_capability = cached.next_capability
             else:
                 try:
                     node = self._router.resolve(capability)
-                    result = node.execute(branch.envelope)
+                    result = await asyncio.to_thread(node.execute, branch.envelope)
                     branch.state = dict(result.envelope.state)
                     branch.history = list(result.envelope.history)
-                    
+                    branch._next_capability = result.envelope.next
+
                     latency = (time.perf_counter() - start_time) * 1000
-                    
+
                     computation_graph.register_computation(
                         capability=capability,
-                        input_data=branch.input,
-                        output_data=branch.state,
+                        input_data=fingerprint,
+                        output_data={
+                            k: v
+                            for k, v in branch.state.items()
+                            if not str(k).startswith("_")
+                        },
                         latency_ms=latency,
-                        success=True,
+                        success=result.success,
+                        next_capability=branch._next_capability,
                     )
+                    if not result.success or result.envelope.terminated:
+                        branch.terminate(
+                            result.error
+                            or result.envelope.error
+                            or "branch node failed"
+                        )
                 except Exception as e:
                     branch.terminate(str(e))
-                    
-            branch._next_capability = branch._plan.next()
-            
-        branch._state = OrganismState.LEARNING
+
+        if not branch.terminated:
+            branch._state = OrganismState.LEARNING
         return branch
 
     async def execute_time_split(
@@ -529,30 +609,47 @@ class TimeSplitter:
         computation_graph: ComputationGraph,
     ) -> Organism:
         branches = self.split(organism, branch_capabilities)
-        
+
         async def run_branch(b: Organism) -> Organism:
             try:
-                return await self.execute_branch(b, computation_graph)
+                return await asyncio.wait_for(
+                    self.execute_branch(b, computation_graph),
+                    timeout=self._timeout_ms / 1000.0,
+                )
+            except asyncio.TimeoutError:
+                b.terminate("branch timeout")
+                return b
             except Exception as e:
                 b.terminate(str(e))
                 return b
-        
-        tasks = [run_branch(b) for b in branches]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        successful = [
-            r for r in results
-            if isinstance(r, Organism) and not r.terminated
-        ]
-        
-        if successful:
-            winner = min(successful, key=lambda r: r.execution_time_ms or float('inf'))
+
+        tasks = [asyncio.create_task(run_branch(b)) for b in branches]
+        pending: set[asyncio.Task[Organism]] = set(tasks)
+        winner: Organism | None = None
+
+        while pending and winner is None:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                result = task.result()
+                if isinstance(result, Organism) and not result.terminated:
+                    winner = result
+                    break
+
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if winner:
             organism.state = dict(winner.state)
             organism.history = list(winner.history)
             organism._children = branches
             organism._state = OrganismState.LEARNING
+            organism.state["_time_split_winner"] = winner.id
             return organism
-        
+
         organism.terminate("All branches failed")
         return organism
 
@@ -714,11 +811,14 @@ class SwarmCoordinator:
     Like MapReduce, but request-native.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, router: CapabilityRouter | None = None) -> None:
+        self._router = router
         self._swarms: dict[str, list[Organism]] = {}
         self._shared_state: dict[str, dict[str, Any]] = {}
         self._partition_fn: Callable[[Any], str] | None = None
         self._reducers: dict[str, Callable[[list[Any]], Any]] = {}
+        self._last_error_count = 0
+        self._last_worker_count = 0
 
     def create_swarm(
         self,
@@ -732,7 +832,7 @@ class SwarmCoordinator:
             worker.id = f"{swarm_id}_worker_{i}"
             worker._state = OrganismState.EXPLORING
             swarm.append(worker)
-            
+
         self._swarms[swarm_id] = swarm
         self._shared_state[swarm_id] = {}
         return swarm
@@ -749,31 +849,111 @@ class SwarmCoordinator:
         capability: str,
         computation_graph: ComputationGraph,
         data: list[Any],
+        fail_fast: bool = False,
+        router: CapabilityRouter | None = None,
     ) -> Any:
         if swarm_id not in self._swarms:
             raise ValueError(f"Swarm {swarm_id} not found")
-            
+
+        active_router = router or self._router
+        if active_router is None:
+            raise ValueError("Router required to execute swarm workers")
+
         swarm = self._swarms[swarm_id]
-        
+        self._last_worker_count = len(swarm)
+        self._last_error_count = 0
+
+        partitions: dict[str, list[Any]] = defaultdict(list)
         if self._partition_fn:
-            partitions: dict[str, list[Any]] = defaultdict(list)
             for item in data:
                 partition_key = self._partition_fn(item)
                 partitions[partition_key].append(item)
-                
-            for i, worker in enumerate(swarm):
-                partition_data = list(partitions.values())[i % len(partitions)] if partitions else []
-                worker.input["partition_data"] = partition_data
-        
-        results = []
-        for worker in swarm:
+        else:
+            # Round-robin partition across workers when no custom fn
+            for i, item in enumerate(data):
+                partitions[str(i % max(len(swarm), 1))].append(item)
+
+        partition_values = list(partitions.values()) if partitions else [[] for _ in swarm]
+        for i, worker in enumerate(swarm):
+            partition_data = (
+                partition_values[i % len(partition_values)] if partition_values else []
+            )
+            worker.input["partition_data"] = partition_data
             worker.set_next(capability)
-            
+
+        results: list[Any] = []
+        for worker in swarm:
+            fingerprint = {
+                "input": worker.input,
+                "state": {
+                    k: v for k, v in worker.state.items() if not str(k).startswith("_")
+                },
+            }
+            try:
+                cached = computation_graph.get_cached_result(capability, fingerprint)
+                if cached:
+                    for key, value in cached.state.items():
+                        if not str(key).startswith("_"):
+                            worker.state[key] = value
+                    worker.state["_from_shared"] = True
+                    worker._next_capability = cached.next_capability
+                    worker._state = OrganismState.LEARNING
+                    results.append(
+                        worker.state.get("partition_result", worker.state.get("result", worker.state))
+                    )
+                    continue
+
+                node = active_router.resolve(capability)
+                envelope = worker.envelope
+                envelope.next = capability
+                result = node.execute(envelope)
+                worker.state = dict(result.envelope.state)
+                worker.history = list(result.envelope.history)
+                worker._next_capability = result.envelope.next
+
+                computation_graph.register_computation(
+                    capability=capability,
+                    input_data=fingerprint,
+                    output_data={
+                        k: v
+                        for k, v in worker.state.items()
+                        if not str(k).startswith("_")
+                    },
+                    latency_ms=0.0,
+                    success=result.success,
+                    next_capability=worker._next_capability,
+                )
+
+                if not result.success:
+                    self._last_error_count += 1
+                    worker.terminate(result.error or "swarm worker failed")
+                    if fail_fast:
+                        raise RuntimeError(result.error or "swarm worker failed")
+                    continue
+
+                worker._state = OrganismState.LEARNING
+                results.append(
+                    worker.state.get("partition_result", worker.state.get("result", worker.state))
+                )
+            except Exception as e:
+                self._last_error_count += 1
+                worker.terminate(str(e))
+                if fail_fast:
+                    raise
+
+        self._shared_state[swarm_id]["results"] = results
         reducer = self._reducers.get(swarm_id, lambda x: x)
         return reducer(results)
 
     def get_swarm_results(self, swarm_id: str) -> list[Organism]:
         return self._swarms.get(swarm_id, [])
+
+    def get_last_swarm_stats(self) -> dict[str, Any]:
+        return {
+            "worker_count": self._last_worker_count,
+            "error_count": self._last_error_count,
+            "error_rate": self._last_error_count / max(self._last_worker_count, 1),
+        }
 
 
 class OrganismRegistry:
@@ -928,8 +1108,51 @@ class OrganismExecutor:
     Handles the full lifecycle: spawn → explore → execute → learn → store.
     """
 
-    def __init__(self, router: CapabilityRouter) -> None:
+    def __init__(
+        self,
+        router: CapabilityRouter,
+        watcher: OrganismWatcher | None = None,
+        event_bus: Any | None = None,
+    ) -> None:
         self._router = router
+        self._watcher = watcher if watcher is not None else OrganismWatcher()
+        self._event_bus = event_bus
+        self._mutations: dict[str, OrganismMutation] = {}
+        self._execute_latencies_ms: list[float] = []
+
+    @property
+    def watcher(self) -> OrganismWatcher:
+        return self._watcher
+
+    def get_mutation(self, organism_id: str) -> OrganismMutation | None:
+        return self._mutations.get(organism_id)
+
+    @staticmethod
+    def _fingerprint(organism: Organism) -> dict[str, Any]:
+        return {
+            "input": organism.input,
+            "state": {
+                k: v for k, v in organism.state.items() if not str(k).startswith("_")
+            },
+        }
+
+    @staticmethod
+    def _public_state(state: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in state.items() if not str(k).startswith("_")}
+
+    def _record_mutations(
+        self,
+        mutation: OrganismMutation,
+        capability: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> None:
+        keys = set(before) | set(after)
+        for key in keys:
+            old_value = before.get(key)
+            new_value = after.get(key)
+            if old_value != new_value:
+                mutation.record_change(capability, key, old_value, new_value)
 
     async def execute(
         self,
@@ -937,19 +1160,28 @@ class OrganismExecutor:
         computation_graph: ComputationGraph | None = None,
     ) -> Organism:
         computation_graph = computation_graph or ComputationGraph()
-        
+
         organism._state = OrganismState.EXECUTING
         start_time = time.perf_counter()
-        
-        # Create envelope ONCE and keep reference to it
-        # Don't use organism.envelope property in the loop!
+        mutation = OrganismMutation(organism.id)
+        self._mutations[organism.id] = mutation
+        self._watcher.notify(organism, "spawned")
+
+        if self._event_bus is not None:
+            intent_str = (
+                organism.intent.value
+                if isinstance(organism.intent, Intent)
+                else str(organism.intent)
+            )
+            await self._event_bus.emit_request_started(organism.id, intent_str)
+
         intent_value = organism.intent
         if isinstance(intent_value, str):
             try:
                 intent_value = Intent(intent_value)
             except ValueError:
                 intent_value = Intent.CUSTOM
-        
+
         envelope = RequestEnvelope(
             id=organism.id,
             intent=intent_value,
@@ -961,56 +1193,141 @@ class OrganismExecutor:
             next=organism._next_capability,
             parent_id=organism._parent_organism_id,
         )
-        
-        while organism._next_capability and not organism.terminated:
-            capability = organism.get_capability()
-            if not capability:
-                break
-            
-            shared = computation_graph.find_shared_computation(capability, organism.input)
-            
-            if shared:
-                organism.state["_from_shared"] = True
-                organism.state["_shared_node_id"] = shared.id
-                organism._computation_node_id = shared.id
-                # Terminate since we're reusing shared computation
-                envelope.next = None
-            else:
-                try:
-                    node = self._router.resolve(capability)
-                    result = node.execute(envelope)
-                    
-                    # Update envelope reference from result
-                    envelope = result.envelope
-                    organism.state = dict(envelope.state)
-                    organism.history = list(envelope.history)
-                    
-                    latency = (time.perf_counter() - start_time) * 1000
-                    success = result.success and not envelope.terminated
-                    
-                    computation_graph.register_computation(
-                        capability=capability,
-                        input_data=organism.input,
-                        output_data=organism.state,
-                        latency_ms=latency,
-                        success=success,
-                    )
-                    
-                    if not success:
-                        organism._next_capability = None
-                        organism.terminate(result.error or envelope.error)
-                        break
-                except Exception as e:
-                    organism._next_capability = None
-                    organism.terminate(str(e))
+
+        try:
+            while organism._next_capability and not organism.terminated:
+                capability = organism.get_capability()
+                if not capability:
                     break
-            
-            # Sync next capability from envelope
-            organism._next_capability = envelope.next
-        
-        if not organism.terminated:
-            organism._state = OrganismState.LEARNING
+
+                before_state = dict(organism.state)
+                fingerprint = self._fingerprint(organism)
+                step_start = time.perf_counter()
+                cached = computation_graph.get_cached_result(capability, fingerprint)
+
+                if cached:
+                    for key, value in cached.state.items():
+                        if not str(key).startswith("_"):
+                            organism.state[key] = value
+                    organism.state["_from_shared"] = True
+                    organism.state["_shared_node_id"] = cached.node.id
+                    organism._computation_node_id = cached.node.id
+                    envelope.state = organism.state
+                    organism._next_capability = cached.next_capability
+                    envelope.next = cached.next_capability
+
+                    if self._event_bus is not None:
+                        from prismpipe.events import Event, EventType
+
+                        await self._event_bus.publish(
+                            Event(
+                                type=EventType.CACHE_HIT,
+                                timestamp=datetime.now(timezone.utc),
+                                data={
+                                    "capability": capability,
+                                    "request_id": organism.id,
+                                    "shared_node_id": cached.node.id,
+                                },
+                            )
+                        )
+                else:
+                    try:
+                        node = self._router.resolve(capability)
+                        result = node.execute(envelope)
+
+                        envelope = result.envelope
+                        organism.state = dict(envelope.state)
+                        organism.history = list(envelope.history)
+                        organism._next_capability = envelope.next
+
+                        latency = (time.perf_counter() - step_start) * 1000
+                        success = result.success and not envelope.terminated
+
+                        computation_graph.register_computation(
+                            capability=capability,
+                            input_data=fingerprint,
+                            output_data=self._public_state(organism.state),
+                            latency_ms=latency,
+                            success=success,
+                            next_capability=envelope.next,
+                        )
+
+                        if self._event_bus is not None:
+                            await self._event_bus.emit_node_executed(
+                                capability=capability,
+                                latency_ms=latency,
+                                success=success,
+                                request_id=organism.id,
+                            )
+
+                        if not success:
+                            organism.terminate(result.error or envelope.error or "node failed")
+                            break
+                    except Exception as e:
+                        organism.terminate(str(e))
+                        if self._event_bus is not None:
+                            await self._event_bus.emit_node_executed(
+                                capability=capability,
+                                latency_ms=(time.perf_counter() - step_start) * 1000,
+                                success=False,
+                                request_id=organism.id,
+                            )
+                        break
+
+                self._record_mutations(
+                    mutation, capability, before_state, organism.state
+                )
+                self._watcher.notify(organism, "node_executed")
+
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            self._execute_latencies_ms.append(duration_ms)
+
+            if organism.terminated:
+                self._watcher.notify(organism, "failed")
+                if self._event_bus is not None:
+                    from prismpipe.events import Event, EventType
+
+                    await self._event_bus.publish(
+                        Event(
+                            type=EventType.REQUEST_FAILED,
+                            timestamp=datetime.now(timezone.utc),
+                            data={
+                                "request_id": organism.id,
+                                "duration_ms": duration_ms,
+                                "error": organism.state.get("_error"),
+                            },
+                        )
+                    )
+            else:
+                organism._state = OrganismState.LEARNING
+                self._watcher.notify(organism, "completed")
+                if self._event_bus is not None:
+                    await self._event_bus.emit_request_completed(
+                        organism.id, duration_ms
+                    )
+        except Exception:
+            organism._state = OrganismState.TERMINATED
+            self._watcher.notify(organism, "failed")
+            raise
+
         return organism
+
+    def get_execute_latency_stats(self) -> dict[str, float]:
+        if not self._execute_latencies_ms:
+            return {"count": 0, "p95": 0.0, "p99": 0.0, "avg": 0.0}
+        values = sorted(self._execute_latencies_ms)
+        n = len(values)
+
+        def percentile(p: float) -> float:
+            idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+            return values[idx]
+
+        return {
+            "count": float(n),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "avg": sum(values) / n,
+        }
 
 
 class ReplayEngine:
@@ -1561,7 +1878,7 @@ class RequestMemory:
 class PrismEngine:
     """The complete PrismPipe execution engine with organic request processing."""
 
-    def __init__(self) -> None:
+    def __init__(self, event_bus: Any | None = None) -> None:
         self.router = CapabilityRouter()
         self.replay_engine = ReplayEngine()
         self.diff_engine = DiffEngine()
@@ -1572,14 +1889,22 @@ class PrismEngine:
         self.request_memory = RequestMemory()
         self.ancestry_tree = AncestryTree()
         self.semantic_cache = SemanticCache()
-        
+
         self.computation_graph = ComputationGraph()
         self.organism_registry = OrganismRegistry()
         self.pipeline_evolver = PipelineEvolver()
         self.intent_planner = IntentPlanner(self.router)
-        self.swarm_coordinator = SwarmCoordinator()
+        self.swarm_coordinator = SwarmCoordinator(self.router)
         self.gravity_engine = GravityEngine()
-        self.organism_executor = OrganismExecutor(self.router)
+        self.organism_watcher = OrganismWatcher()
+        self.organism_persistence = OrganismPersistence()
+        self._event_bus = event_bus
+        self.organism_executor = OrganismExecutor(
+            self.router,
+            watcher=self.organism_watcher,
+            event_bus=event_bus,
+        )
+        self._execute_count = 0
 
     def register_node(
         self,
@@ -1588,17 +1913,17 @@ class PrismEngine:
         cost: NodeCost | None = None,
     ) -> "PrismEngine":
         self.router.register(node.capability, node)
-        
+
         if spec:
             self.capability_graph.register(spec)
             self.intent_planner.register_capability(
                 spec.capability,
                 spec.description,
             )
-            
+
         if cost:
             self.cost_optimizer.register_cost(cost)
-            
+
         return self
 
     def spawn_organism(
@@ -1614,11 +1939,12 @@ class PrismEngine:
             initial_capability=initial_capability,
             parent_organism_id=parent_organism_id,
         )
-        
+
         if initial_capability:
             organism._plan.add(initial_capability)
-        
+
         self.organism_registry.register(organism)
+        self.organism_watcher.notify(organism, "spawned")
         return organism
 
     def spawn_organism_from_envelope(
@@ -1642,7 +1968,9 @@ class PrismEngine:
         use_computation_sharing: bool = True,
     ) -> Organism:
         computation = self.computation_graph if use_computation_sharing else ComputationGraph()
-        return await self.organism_executor.execute(organism, computation)
+        result = await self.organism_executor.execute(organism, computation)
+        self._execute_count += 1
+        return result
 
     async def execute_child_organism(
         self,
@@ -1671,9 +1999,17 @@ class PrismEngine:
         self,
         organism: Organism,
         branch_capabilities: list[str],
+        max_branches: int = 4,
+        timeout_ms: int = 5000,
     ) -> Organism:
-        splitter = TimeSplitter(self.router)
-        return await splitter.execute_time_split(organism, branch_capabilities, self.computation_graph)
+        splitter = TimeSplitter(
+            self.router,
+            max_branches=max_branches,
+            timeout_ms=timeout_ms,
+        )
+        return await splitter.execute_time_split(
+            organism, branch_capabilities, self.computation_graph
+        )
 
     def create_swarm(
         self,
@@ -1689,9 +2025,15 @@ class PrismEngine:
         swarm_id: str,
         capability: str,
         data: list[Any],
+        fail_fast: bool = False,
     ) -> Any:
         return await self.swarm_coordinator.execute_swarm(
-            swarm_id, capability, self.computation_graph, data
+            swarm_id,
+            capability,
+            self.computation_graph,
+            data,
+            fail_fast=fail_fast,
+            router=self.router,
         )
 
     def plan_intent(self, intent: str) -> list[str]:
@@ -1709,12 +2051,30 @@ class PrismEngine:
         organism: Organism,
     ) -> Organism:
         similar = self.organism_registry.find_similar(organism)
-        
+
         if similar:
             best = similar[0]
             organism.inherit_from(best, inherit_state=True, inherit_knowledge=True)
-            
+
         return organism
+
+    def get_metrics(self) -> dict[str, Any]:
+        dedup = self.computation_graph.get_deduplication_stats()
+        latency = self.organism_executor.get_execute_latency_stats()
+        swarm = self.swarm_coordinator.get_last_swarm_stats()
+        return {
+            "hit_ratio": dedup.get("hit_ratio", 0.0),
+            "deduplication_ratio": dedup.get("deduplication_ratio", 0.0),
+            "hits": dedup.get("hits", 0),
+            "misses": dedup.get("misses", 0),
+            "unique_computations": dedup.get("unique_computations", 0),
+            "execute_p95": latency.get("p95", 0.0),
+            "execute_p99": latency.get("p99", 0.0),
+            "execute_count": self._execute_count,
+            "swarm_worker_count": swarm.get("worker_count", 0),
+            "swarm_error_rate": swarm.get("error_rate", 0.0),
+            "organism_count": len(self.organism_registry._organisms),
+        }
 
     async def execute(self, envelope: RequestEnvelope) -> RequestEnvelope:
         intent_str = envelope.intent.value if isinstance(envelope.intent, Intent) else str(envelope.intent)
@@ -1827,23 +2187,28 @@ class StreamingOrganism:
 
 class OrganismPersistence:
     """Persist organisms to storage - they can be hibernated and resumed."""
-    
+
     def __init__(self, storage_backend: Any = None):
         self._storage = storage_backend
         self._persisted: dict[str, dict[str, Any]] = {}
-    
-    def hibernate(self, organism: Organism) -> str:
-        """Save organism state and return hibernation ID."""
-        hibernation_id = f"hib_{uuid.uuid4().hex[:8]}"
-        
-        data = {
+
+    def _serialize(self, organism: Organism) -> dict[str, Any]:
+        return {
             "id": organism.id,
-            "intent": organism.intent.value if isinstance(organism.intent, Intent) else str(organism.intent),
+            "intent": organism.intent.value
+            if isinstance(organism.intent, Intent)
+            else str(organism.intent),
             "input": organism.input,
             "state": organism.state,
             "history": [h.model_dump() for h in organism.history],
             "knowledge": [
-                {"key": k.key, "value": k.value, "confidence": k.confidence}
+                {
+                    "key": k.key,
+                    "value": k.value,
+                    "confidence": k.confidence,
+                    "source_capability": k.source_capability,
+                    "tags": list(k.tags),
+                }
                 for k in organism.knowledge
             ],
             "_next_capability": organism._next_capability,
@@ -1851,22 +2216,8 @@ class OrganismPersistence:
             "created_at": organism._created_at.isoformat(),
             "hibernated_at": datetime.now(timezone.utc).isoformat(),
         }
-        
-        self._persisted[hibernation_id] = data
-        
-        if self._storage:
-            # TODO: Write to actual storage
-            pass
-        
-        return hibernation_id
-    
-    def wake(self, hibernation_id: str) -> Organism | None:
-        """Restore organism from hibernation."""
-        if hibernation_id not in self._persisted:
-            return None
-        
-        data = self._persisted[hibernation_id]
-        
+
+    def _deserialize(self, data: dict[str, Any]) -> Organism:
         organism = Organism(
             intent=data["intent"],
             input_data=data["input"],
@@ -1875,16 +2226,53 @@ class OrganismPersistence:
         organism.id = data["id"]
         organism.state = data["state"]
         organism._next_capability = data.get("_next_capability")
-        
         organism.history = [HistoryEntry(**h) for h in data.get("history", [])]
-        
         for k in data.get("knowledge", []):
-            organism.ingest_knowledge(k["key"], k["value"], k["confidence"])
-        
+            organism.ingest_knowledge(
+                k["key"],
+                k["value"],
+                k.get("confidence", 1.0),
+                capability=k.get("source_capability"),
+                tags=k.get("tags"),
+            )
         return organism
-    
+
+    async def hibernate(self, organism: Organism) -> str:
+        """Save organism state and return hibernation ID."""
+        hibernation_id = f"hib_{uuid.uuid4().hex[:8]}"
+        data = self._serialize(organism)
+        self._persisted[hibernation_id] = data
+
+        if self._storage is not None:
+            await self._storage.save(hibernation_id, data)
+
+        organism._state = OrganismState.SUSPENDED
+        return hibernation_id
+
+    async def wake(self, hibernation_id: str) -> Organism | None:
+        """Restore organism from hibernation."""
+        data = self._persisted.get(hibernation_id)
+        if data is None and self._storage is not None:
+            data = await self._storage.load(hibernation_id)
+            if data is not None:
+                self._persisted[hibernation_id] = data
+
+        if data is None:
+            return None
+
+        organism = self._deserialize(data)
+        organism._state = OrganismState.SPAWNED
+        return organism
+
     def list_hibernated(self) -> list[str]:
         return list(self._persisted.keys())
+
+    async def list_hibernated_async(self) -> list[str]:
+        keys = set(self._persisted.keys())
+        if self._storage is not None:
+            stored = await self._storage.list_keys("hib_")
+            keys.update(stored)
+        return sorted(keys)
 
 
 class EventDrivenOrganism:
@@ -1997,6 +2385,7 @@ __all__ = [
     "OrganismState",
     "KnowledgeAtom",
     "ComputationNode",
+    "CachedComputation",
     "ComputationGraph",
     "Organism",
     "TimeSplitter",

@@ -1,134 +1,111 @@
+
 # Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
 # C extensions
-*.so
-
-# Python cache
-*.pyc
-*.pyo
-
+# Celery
+# Cython
+# Dependency managers
 # Distribution / packaging
-.Python
-build/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+# Django
+# Documentation
+# Flask
+# IDEs
+# IPython
+# Installer logs
+# Jupyter
+# OS
+# PEP 582
+# PyBuilder
+# PyInstaller
+# Python cache
+# Python version manager
+# SageMath
+# Scrapy
+# Translations
+# Type checkers
+# Unit test / coverage reports
+# Virtual environments
+*$py.class
+*.cover
 *.egg
 *.egg-info/
-.installed.cfg
-MANIFEST
-
-# PyInstaller
+*.log
 *.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-coverage.xml
-nosetests.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
-
-# Type checkers
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-
-# Translations
 *.mo
 *.pot
-
-# Django
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask
-instance/
-.webassets-cache
-
-# Scrapy
-.scrapy
-
-# Documentation
-docs/_build/
-site/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# IPython
-profile_default/
-ipython_config.py
-
-# Python version manager
-.python-version
-
-# Dependency managers
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath
+*.py,cover
+*.py[cod]
+*.pyc
+*.pyo
 *.sage.py
-
-# Virtual environments
+*.so
+*.spec
+*.swo
+*.swp
+*~
+.DS_Store
+.Python
+.cache
+.coverage
+.coverage.*
+.dmypy.json
+.eggs/
 .env
-.venv/
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# IDEs
-.vscode/
+.hypothesis/
 .idea/
+.installed.cfg
+.ipynb_checkpoints/
+.mypy_cache/
+.nox/
+.pybuilder/
+.pyre/
+.pytest_cache/
+.python-version
+.pytype/
+.ropeproject
+.scrapy
 .spyderproject
 .spyproject
-.ropeproject
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
+.tox/
+.venv/
+.vscode/
+.webassets-cache
+ENV/
+MANIFEST
+Pipfile.lock
 Thumbs.db
-
-# Cython
-cython_debug/
+__pycache__/
+__pypackages__/
+build/
+celerybeat-schedule
+celerybeat.pid
+cover/
+coverage.xml
+cython_debug/scripts/bench/last_results.json
+db.sqlite3
+db.sqlite3-journal
+dist/
+dmypy.json
+docs/_build/
+downloads/
+eggs/
+env.bak/
+env/
+htmlcov/
+instance/
+ipython_config.py
+lib/
+lib64/
+local_settings.py
+nosetests.xml
+parts/
+pip-delete-this-directory.txt
+pip-log.txt
+profile_default/
+sdist/
+share/python-wheels/
+site/
+target/
+var/
+venv.bak/
+venv/
+wheels/
