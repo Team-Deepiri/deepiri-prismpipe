@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from prismpipe import OrganismPersistence, PrismEngine, create_envelope
+from prismpipe.bench_nodes import BenchComputeNode, BenchPartitionNode
 from prismpipe.core import Intent, Node, NodeResult
 from prismpipe.deepiri_nodes import register_deepiri_nodes
 from prismpipe.events import get_event_bus
@@ -164,28 +165,6 @@ class ResponseNotFoundNode(Node):
             "body": {"error": "Not Found", "code": "ROUTE_NOT_FOUND"},
             "headers": {},
         }
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
-
-
-class BenchComputeNode(Node):
-    """Deterministic node for benchmarks / organism API demos."""
-
-    capability = "bench.compute"
-
-    def process(self, envelope):
-        n = int(envelope.input.get("n", 1))
-        envelope.state["result"] = n * 2
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
-
-
-class BenchPartitionNode(Node):
-    capability = "bench.partition_sum"
-
-    def process(self, envelope):
-        data = envelope.input.get("partition_data", [])
-        envelope.state["partition_result"] = sum(data) if isinstance(data, list) else 0
         envelope.set_next(None)
         return NodeResult(envelope=envelope)
 

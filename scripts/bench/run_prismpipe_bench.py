@@ -17,57 +17,21 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from prismpipe.core.node import Node, NodeResult  # noqa: E402
-from prismpipe.engine import PrismEngine  # noqa: E402
+from prismpipe.bench_nodes import (  # noqa: E402
+    BenchComputeNode,
+    FastBranch,
+    PartitionSumNode,
+    SlowBranch,
+)
+from prismpipe.engine import OrganismPersistence, PrismEngine  # noqa: E402
 from prismpipe.storage import MemoryStorage  # noqa: E402
-
-
-class BenchComputeNode(Node):
-    capability = "bench.compute"
-
-    def process(self, envelope):
-        n = int(envelope.input.get("n", 1))
-        envelope.state["result"] = n * 2
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
-
-
-class PartitionSumNode(Node):
-    capability = "bench.partition_sum"
-
-    def process(self, envelope):
-        data = envelope.input.get("partition_data", [])
-        envelope.state["partition_result"] = sum(data) if isinstance(data, list) else 0
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
-
-
-class FastBranch(Node):
-    capability = "bench.fast"
-
-    def process(self, envelope):
-        envelope.state["path"] = "fast"
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
-
-
-class SlowBranch(Node):
-    capability = "bench.slow"
-
-    def process(self, envelope):
-        time.sleep(0.05)
-        envelope.state["path"] = "slow"
-        envelope.set_next(None)
-        return NodeResult(envelope=envelope)
 
 
 def _engine() -> PrismEngine:
     engine = PrismEngine()
     for node in (BenchComputeNode(), PartitionSumNode(), FastBranch(), SlowBranch()):
         engine.register_node(node)
-    engine.organism_persistence = type(engine.organism_persistence)(
-        storage_backend=MemoryStorage()
-    )
+    engine.organism_persistence = OrganismPersistence(storage_backend=MemoryStorage())
     return engine
 
 

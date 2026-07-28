@@ -74,7 +74,12 @@ class CachedComputation:
 
 
 class ComputationGraph:
-    """Shared computation deduplication - compute once, reuse forever."""
+    """Shared computation deduplication - compute once, reuse forever.
+
+    TODO(distributed-cache): back this graph with Redis (or equivalent) so
+    WEB_CONCURRENCY / multi-replica deployments share hits. Until then keep a
+    single process worker so warm pipelines stay correct.
+    """
 
     def __init__(self) -> None:
         self._nodes: dict[str, ComputationNode] = {}
