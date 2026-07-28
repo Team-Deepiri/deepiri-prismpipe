@@ -1,7 +1,7 @@
 """
 PrismPipe Server - FastAPI server with all features.
 
-Run with: uvicorn server:app --reload --port 5011
+Run with: uvicorn server:app --reload --port 8000
 """
 
 from fastapi import FastAPI, Request, Response
@@ -58,15 +58,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         },
         headers={"X-Request-ID": request_id},
     )
-
-@app.exception_handler(asyncio.CancelledError)
-async def cancelled_handler(request: Request, exc: asyncio.CancelledError):
-    request_id = getattr(request.state, "request_id", str(uuid4()))
-    return JSONResponse(
-        status_code=499,
-        content={"detail": "Request cancelled", "request_id": request_id},
-        headers={"X-Request-ID": request_id},
-    )             
 
 # =============================================================================
 # EXAMPLE NODES - Connect to your services
@@ -442,4 +433,3 @@ async def demo_intent_routing(intent: str):
         "executed": [h.capability for h in result.history],
         "success": not result.terminated,
     }
-

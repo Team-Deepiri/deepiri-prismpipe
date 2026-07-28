@@ -12,7 +12,7 @@
 
 - SDK decorators (@node, @enrich, @transform, @validate)
 
-- FastAPI server on port 5011
+- FastAPI server on port 8000
 
 
 #### ORGANIC PIPE SYSTEM (NEW - 16 FEATURES)
@@ -107,7 +107,7 @@
 - RequestEnvelope, CapabilityRouter, Pipeline
 - 10 Engine features (Replay, Diff, Graph, Remote, Stream, Parallel, Cost, Cache, Ancestry, Memory)
 - SDK decorators (@node, @enrich, @transform, @validate)
-- FastAPI server on port 5011
+- FastAPI server on port 8000
 
 #### ORGANIC PIPE SYSTEM (NEW - 16 FEATURES)
 
@@ -216,20 +216,19 @@
 
 #### 17. TypeScript SDK
 
-- [ ] **Julie** - Create sdk/typescript/ package structure
-- [ ] **Julie** - Generate TypeScript types from Python
-- [ ] **Julie** - Implement Node.js client with organism support
+- [ ] Create sdk/typescript/ package structure
+- [ ] Generate TypeScript types from Python
+- [ ] Implement Node.js client with organism support
 
 #### 18. Examples
 
-- [ ] **Julie** - Expand examples/http_api/
-- [ ] **Tyler** - Create examples/organic_demo.py (DEMO RUNNING ✓)
-- [ ] **Ryan** - Add examples/data_pipeline/
+- [ ] Expand examples/http_api/
+- [ ] Create examples/organic_demo.py (DEMO RUNNING ✓)
 
 #### 19. CLI Tools
 
-- [ ] **Julie** - Create prismpipe CLI in cli.py
-- [ ] **Julie** - Add run, replay, inspect, spawn commands
+- [ ] Create prismpipe CLI in cli.py
+- [ ] Add run, replay, inspect, spawn commands
 
 ---
 
@@ -237,23 +236,23 @@
 
 #### 20. Package Publishing
 
-- [ ] **Ryan** - Publish to PyPI
-- [ ] **Julie** - Publish npm package
-- [ ] **Ryan** - Kubernetes manifests
-- [ ] **Ryan** - Helm chart
+- [ ] Publish to PyPI
+- [ ] Publish npm package
+- [ ] Kubernetes manifests
+- [ ] Helm chart
 
 #### 21. Organic Pipe Infrastructure
 
-- [ ] **Ryan** - Organic pipe persistence backend
-- [ ] **Julie** - Cross-node organism registry
+- [ ] Organic pipe persistence backend
+- [ ] Cross-node organism registry
 
 - Infrastructure note: PrismPipe runs under Gunicorn with `uvicorn.workers.UvicornWorker` for worker supervision (auto-restart on worker failure) and multi-core scaling via `WEB_CONCURRENCY`.
 
 ---
 
-## ASSIGNMENTS SUMMARY
+## WORK SUMMARY
 
-### Ryan S. (Backend Engineer) - 12 items
+### Runtime and Distribution Items - 11 items
 
 1.  /health endpoint (simple liveness)
 2.  /ready endpoint (readiness check)
@@ -262,13 +261,12 @@
 5.  Update server.py with health endpoints
 6.  Add request ID propagation
 7.  Graceful shutdown signal handling
-8.  Add examples/data_pipeline/
-9.  Kubernetes manifests
-10. Helm chart
-11. Publish to PyPI
-12. Organic pipe persistence backend
+8.  Kubernetes manifests
+9.  Helm chart
+10. Publish to PyPI
+11. Organic pipe persistence backend
 
-### Julie W. (Backend Engineer) - 12 items
+### SDK and Developer Experience Items - 12 items
 
 1.  Node API key authentication
 2.  Capability-level access control
@@ -283,7 +281,7 @@
 11. Publish npm package
 12. Cross-node organism registry
 
-### Tyler C. (AI Engineer) - 16 items
+### Organic and AI Infrastructure Items - 16 items
 
 1.  Redis/PostgreSQL persistence for organisms
 2.  Distributed computation graph
@@ -308,15 +306,15 @@
 
 ### Week 1: Production Essentials
 
-- Ryan: Health endpoints, graceful shutdown, server enhancements
-- Julie: Security basics, TypeScript SDK kickoff
+- Health endpoints, graceful shutdown, server enhancements
+- Security basics, TypeScript SDK kickoff
 
 ### Week 1-2: Organic Pipe Backend + Developer Experience
 
-- Ryan: Kubernetes manifests, organic pipe persistence backend
-- Julie: TypeScript SDK, CLI tools, examples
+- Kubernetes manifests, organic pipe persistence backend
+- TypeScript SDK, CLI tools, examples
 
-### Week 2-3: AI Features (Tyler)
+### Week 2-3: AI Features
 
 - Intent LLM adapter
 - Pipeline A/B testing
@@ -324,8 +322,8 @@
 
 ### Week 3: Distribution
 
-- Julie: npm publish, cross-node organism registry
-- Ryan: PyPI publish, Helm chart, data_pipeline example
+- npm publish, cross-node organism registry
+- PyPI publish, Helm chart
 
 ### Week 4: Final Polish (Shared)
 
