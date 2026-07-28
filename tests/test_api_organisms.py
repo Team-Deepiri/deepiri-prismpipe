@@ -97,3 +97,38 @@ def test_deepiri_pipeline_endpoint_registered(client):
     assert "report" in body
     assert "metrics" in body
     assert body["useful"] is True
+
+
+def test_session_fast_path_slim_and_cached(client):
+    from unittest.mock import AsyncMock, patch
+
+    session = {
+        "authenticated": True,
+        "user": {"id": "u1"},
+        "lis_ready": True,
+        "auth_verify": {"ok": True, "status_code": 200, "body": {"user": {"id": "u1"}}, "url": "x"},
+        "lis_health": {"ok": True, "status_code": 200, "body": {"status": "ok"}, "url": "y"},
+        "useful": True,
+        "productivity": {
+            "client_round_trips_saved": 1,
+            "parallel_hops": ["auth.verify", "lis.health"],
+            "downstream_http_calls": 2,
+        },
+    }
+    boot = AsyncMock(return_value=session)
+    with patch("server.bootstrap_session_async", boot):
+        first = client.post(
+            "/pipelines/deepiri/session",
+            json={"authorization": "Bearer tok.a", "use_computation_sharing": True},
+        )
+        second = client.post(
+            "/pipelines/deepiri/session",
+            json={"authorization": "Bearer tok.a", "use_computation_sharing": True},
+        )
+    assert first.status_code == 200
+    assert first.json()["useful"] is True
+    assert first.json()["path"] == "fast"
+    assert "organism" not in first.json()
+    assert "metrics" not in first.json()
+    assert second.json()["path"] == "cache"
+    assert boot.await_count == 1

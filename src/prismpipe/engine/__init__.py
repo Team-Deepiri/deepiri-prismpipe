@@ -241,6 +241,8 @@ class ComputationGraph:
         self,
         capability: str,
         input_data: dict[str, Any],
+        *,
+        use_redis: bool = True,
     ) -> CachedComputation | None:
         """Lookup shared computation and return restorable outputs on hit."""
         input_hash = self.compute_input_hash(capability, input_data)
@@ -266,11 +268,11 @@ class ComputationGraph:
                         next_capability=stored.get("next"),
                     )
 
-        cached = self._hydrate_from_redis(capability, lookup_key)
-        if cached is not None:
-            return cached
-
-        self._misses += 1
+        if use_redis:
+            cached = self._hydrate_from_redis(capability, lookup_key)
+            if cached is not None:
+                return cached
+            self._misses += 1
         return None
 
     def register_computation(
@@ -282,6 +284,7 @@ class ComputationGraph:
         success: bool,
         parent_node_id: str | None = None,
         next_capability: str | None = None,
+        persist_redis: bool = True,
     ) -> ComputationNode:
         input_hash = self.compute_input_hash(capability, input_data)
         output_hash = hashlib.sha256(
@@ -308,7 +311,7 @@ class ComputationGraph:
                 "success": success,
                 "expires_at": expires_at,
             }
-            if self._redis is not None:
+            if persist_redis and self._redis is not None:
                 self._store_redis(
                     lookup_key,
                     existing_id,
@@ -349,6 +352,40 @@ class ComputationGraph:
         if not success:
             stats["failures"] += 1
 
+        if persist_redis:
+            self._store_redis(
+                lookup_key,
+                node_id,
+                output_data,
+                next_capability,
+                latency_ms,
+                success,
+                output_hash,
+                ttl,
+            )
+
+        return node
+
+    def persist_computation_to_redis(
+        self,
+        capability: str,
+        input_data: dict[str, Any],
+        output_data: dict[str, Any],
+        latency_ms: float,
+        success: bool,
+        next_capability: str | None = None,
+    ) -> None:
+        """Best-effort Redis fan-out after an L1-only register (non-critical path)."""
+        if self._redis is None:
+            return
+        input_hash = self.compute_input_hash(capability, input_data)
+        lookup_key = f"{capability}:{input_hash}"
+        node_id = self._hash_to_node.get(lookup_key)
+        if not node_id:
+            return
+        node = self._nodes.get(node_id)
+        output_hash = node.output_hash if node else ""
+        ttl = self.ttl_for(capability, success=success)
         self._store_redis(
             lookup_key,
             node_id,
@@ -359,8 +396,6 @@ class ComputationGraph:
             output_hash,
             ttl,
         )
-
-        return node
 
     def _store_redis(
         self,
