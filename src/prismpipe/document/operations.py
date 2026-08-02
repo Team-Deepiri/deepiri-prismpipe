@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -62,6 +63,16 @@ class IdempotencyConflictError(DocumentProcessingError):
         )
 
 
+class StaleDocumentOperationClaimError(RuntimeError):
+    """Raised when a worker tries to mutate an operation after losing its claim."""
+
+    def __init__(self, idempotency_key: str) -> None:
+        super().__init__(
+            f"Document operation claim is no longer active: {idempotency_key}"
+        )
+        self.idempotency_key = idempotency_key
+
+
 @dataclass
 class DocumentOperationRecord:
     operation_id: str
@@ -73,6 +84,7 @@ class DocumentOperationRecord:
     normalized_payload: dict[str, Any]
     status: DocumentOperationStatus
     attempt_count: int
+    claim_token: str | None
     created_at: str
     updated_at: str
     result: dict[str, Any] | None
@@ -96,6 +108,7 @@ class DocumentOperationRecord:
             normalized_payload=json.loads(row["normalized_payload"]),
             status=DocumentOperationStatus(row["status"]),
             attempt_count=row["attempt_count"],
+            claim_token=row["claim_token"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             result=_load_optional_json(row["result_json"]),
@@ -159,10 +172,21 @@ class SQLiteDocumentOperationStore:
                     outbound_topic TEXT,
                     outbound_message_id TEXT,
                     outbound_payload_json TEXT,
-                    lease_until TEXT
+                    lease_until TEXT,
+                    claim_token TEXT
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(document_operations)"
+                ).fetchall()
+            }
+            if "claim_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE document_operations ADD COLUMN claim_token TEXT"
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS document_operations_pending_idx
@@ -207,6 +231,7 @@ class SQLiteDocumentOperationStore:
     ) -> DocumentOperationClaim:
         now = _utc_now()
         lease_until = _utc_after(self.claim_lease_seconds)
+        claim_token = uuid.uuid4().hex
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -224,8 +249,8 @@ class SQLiteDocumentOperationStore:
                         created_at, updated_at, result_json, error_json,
                         metadata_json, publication_state, publication_attempts,
                         outbound_topic, outbound_message_id,
-                        outbound_payload_json, lease_until
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL, ?, ?, 0, NULL, NULL, NULL, ?)
+                        outbound_payload_json, lease_until, claim_token
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL, ?, ?, 0, NULL, NULL, NULL, ?, ?)
                     """,
                     (
                         operation_id,
@@ -241,6 +266,7 @@ class SQLiteDocumentOperationStore:
                         canonical_json(request_metadata),
                         PublicationState.NONE.value,
                         lease_until,
+                        claim_token,
                     ),
                 )
                 row = connection.execute(
@@ -273,13 +299,14 @@ class SQLiteDocumentOperationStore:
                 """
                 UPDATE document_operations
                 SET status = ?, attempt_count = attempt_count + 1,
-                    updated_at = ?, lease_until = ?, error_json = NULL
+                    updated_at = ?, lease_until = ?, claim_token = ?, error_json = NULL
                 WHERE idempotency_key = ?
                 """,
                 (
                     DocumentOperationStatus.PROCESSING.value,
                     now,
                     lease_until,
+                    claim_token,
                     idempotency_key,
                 ),
             )
@@ -311,6 +338,7 @@ class SQLiteDocumentOperationStore:
         self,
         idempotency_key: str,
         *,
+        claim_token: str,
         status: DocumentOperationStatus,
         result: Mapping[str, Any] | None,
         error: Mapping[str, Any] | None,
@@ -321,6 +349,7 @@ class SQLiteDocumentOperationStore:
         return await asyncio.to_thread(
             self._finish_sync,
             idempotency_key,
+            claim_token,
             status,
             dict(result) if result is not None else None,
             dict(error) if error is not None else None,
@@ -332,6 +361,7 @@ class SQLiteDocumentOperationStore:
     def _finish_sync(
         self,
         idempotency_key: str,
+        claim_token: str,
         status: DocumentOperationStatus,
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
@@ -348,18 +378,22 @@ class SQLiteDocumentOperationStore:
             ).fetchone()
             if row is None:
                 raise KeyError(idempotency_key)
-            existing = DocumentOperationRecord.from_row(row)
-            if existing.status is DocumentOperationStatus.SUCCEEDED:
-                connection.commit()
-                return existing
-            connection.execute(
+            expected_status = (
+                DocumentOperationStatus.RETRYABLE_FAILURE
+                if status is DocumentOperationStatus.DEAD_LETTERED
+                else DocumentOperationStatus.PROCESSING
+            )
+            if row["claim_token"] != claim_token or row["status"] != expected_status.value:
+                raise StaleDocumentOperationClaimError(idempotency_key)
+            cursor = connection.execute(
                 """
                 UPDATE document_operations
                 SET status = ?, result_json = ?, error_json = ?,
                     updated_at = ?, lease_until = NULL,
+                    claim_token = NULL,
                     publication_state = ?, outbound_topic = ?,
                     outbound_message_id = ?, outbound_payload_json = ?
-                WHERE idempotency_key = ?
+                WHERE idempotency_key = ? AND claim_token = ? AND status = ?
                 """,
                 (
                     status.value,
@@ -371,8 +405,12 @@ class SQLiteDocumentOperationStore:
                     outbound_message_id,
                     canonical_json(outbound_payload),
                     idempotency_key,
+                    claim_token,
+                    expected_status.value,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise StaleDocumentOperationClaimError(idempotency_key)
             row = connection.execute(
                 "SELECT * FROM document_operations WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -389,40 +427,40 @@ class SQLiteDocumentOperationStore:
     async def record_retryable_failure(
         self,
         idempotency_key: str,
+        claim_token: str,
         error: Mapping[str, Any],
     ) -> DocumentOperationRecord:
         return await asyncio.to_thread(
             self._record_retryable_sync,
             idempotency_key,
+            claim_token,
             dict(error),
         )
 
     def _record_retryable_sync(
         self,
         idempotency_key: str,
+        claim_token: str,
         error: dict[str, Any],
     ) -> DocumentOperationRecord:
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT status FROM document_operations WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(idempotency_key)
-            if row["status"] != DocumentOperationStatus.SUCCEEDED.value:
-                connection.execute(
-                    """
-                    UPDATE document_operations
-                    SET status = ?, error_json = ?, updated_at = ?, lease_until = NULL
-                    WHERE idempotency_key = ?
-                    """,
-                    (
-                        DocumentOperationStatus.RETRYABLE_FAILURE.value,
-                        canonical_json(error),
-                        _utc_now(),
-                        idempotency_key,
-                    ),
-                )
+            cursor = connection.execute(
+                """
+                UPDATE document_operations
+                SET status = ?, error_json = ?, updated_at = ?, lease_until = NULL
+                WHERE idempotency_key = ? AND claim_token = ? AND status = ?
+                """,
+                (
+                    DocumentOperationStatus.RETRYABLE_FAILURE.value,
+                    canonical_json(error),
+                    _utc_now(),
+                    idempotency_key,
+                    claim_token,
+                    DocumentOperationStatus.PROCESSING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleDocumentOperationClaimError(idempotency_key)
             row = connection.execute(
                 "SELECT * FROM document_operations WHERE idempotency_key = ?",
                 (idempotency_key,),

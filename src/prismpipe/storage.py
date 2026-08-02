@@ -6,7 +6,7 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from prismpipe.exceptions import StorageError
 
@@ -102,7 +102,7 @@ class FileStorage(StorageBackend[T]):
             return None
         try:
             with open(path, encoding="utf-8") as handle:
-                return json.load(handle)
+                return cast(T, json.load(handle))
         except Exception as error:
             raise StorageError("load", str(error)) from error
 

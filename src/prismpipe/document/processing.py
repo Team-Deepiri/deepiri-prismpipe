@@ -23,6 +23,7 @@ from prismpipe.document.operations import (
     IdempotencyConflictError,
     PublicationState,
     SQLiteDocumentOperationStore,
+    StaleDocumentOperationClaimError,
     canonical_json,
 )
 from prismpipe.document.vectorize import (
@@ -123,6 +124,7 @@ class DocumentVectorizeProcessor:
             settled = await self._settled_duplicate(claim.record)
             return DocumentProcessingResult(settled, duplicate=True)
 
+        claim_token = _claim_token(claim.record)
         try:
             loaded_request = await self._resolve_chunk_content(request)
             output = await self._execute_vectorizer(loaded_request)
@@ -134,6 +136,7 @@ class DocumentVectorizeProcessor:
             )
             record = await self.operation_store.finish(
                 idempotency_key,
+                claim_token=claim_token,
                 status=DocumentOperationStatus.SUCCEEDED,
                 result=output,
                 error=None,
@@ -148,15 +151,20 @@ class DocumentVectorizeProcessor:
                 "Document vectorization was cancelled",
                 retryable=True,
             )
-            await self.operation_store.record_retryable_failure(
-                idempotency_key,
-                cancellation.to_payload(),
-            )
+            try:
+                await self.operation_store.record_retryable_failure(
+                    idempotency_key,
+                    claim_token,
+                    cancellation.to_payload(),
+                )
+            except StaleDocumentOperationClaimError:
+                pass
             raise
         except DocumentProcessingError as error:
             if error.retryable:
                 record = await self.operation_store.record_retryable_failure(
                     idempotency_key,
+                    claim_token,
                     error.to_payload(),
                 )
                 return DocumentProcessingResult(record)
@@ -278,6 +286,7 @@ class DocumentVectorizeProcessor:
         )
         return await self.operation_store.finish(
             record.idempotency_key,
+            claim_token=_claim_token(record),
             status=(
                 DocumentOperationStatus.DEAD_LETTERED
                 if dead_lettered
@@ -394,49 +403,95 @@ class DocumentVectorizeConsumer:
         max_attempts: int = 3,
         pending_drain_limit: int = 100,
         retry_delay_seconds: float = 0.0,
+        pending_recovery_interval_seconds: float = 1.0,
+        publication_timeout_seconds: float = 30.0,
     ) -> None:
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
+        if pending_drain_limit <= 0:
+            raise ValueError("pending_drain_limit must be positive")
+        if pending_recovery_interval_seconds <= 0:
+            raise ValueError("pending_recovery_interval_seconds must be positive")
+        if publication_timeout_seconds <= 0:
+            raise ValueError("publication_timeout_seconds must be positive")
         self.transport = transport
         self.processor = processor
         self.max_concurrency = max_concurrency
         self.max_attempts = max_attempts
         self.pending_drain_limit = pending_drain_limit
         self.retry_delay_seconds = max(retry_delay_seconds, 0.0)
+        self.pending_recovery_interval_seconds = pending_recovery_interval_seconds
+        self.publication_timeout_seconds = publication_timeout_seconds
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._lifecycle_lock = asyncio.Lock()
         self._dispatcher: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
         self._active: set[asyncio.Task[None]] = set()
         self._stopping = False
 
     async def start(self) -> None:
-        if self._dispatcher is not None and not self._dispatcher.done():
-            return
-        self._stopping = False
-        await self.transport.start()
-        await self.drain_pending_publications(self.pending_drain_limit)
-        self._dispatcher = asyncio.create_task(
-            self._consume(),
-            name="prismpipe-document-vectorize-consumer",
-        )
+        async with self._lifecycle_lock:
+            dispatcher_running = self._dispatcher is not None and not self._dispatcher.done()
+            recovery_running = (
+                self._recovery_task is not None and not self._recovery_task.done()
+            )
+            if dispatcher_running and recovery_running:
+                return
+            previous_tasks = [
+                task
+                for task in (self._dispatcher, self._recovery_task)
+                if task is not None
+            ]
+            for task in previous_tasks:
+                if not task.done():
+                    task.cancel()
+            if previous_tasks:
+                await asyncio.gather(*previous_tasks, return_exceptions=True)
+            self._dispatcher = None
+            self._recovery_task = None
+            self._stopping = False
+            await self.transport.start()
+            await self.drain_pending_publications(self.pending_drain_limit)
+            self._dispatcher = asyncio.create_task(
+                self._consume(),
+                name="prismpipe-document-vectorize-consumer",
+            )
+            self._recovery_task = asyncio.create_task(
+                self._recover_pending_publications(),
+                name="prismpipe-document-publication-recovery",
+            )
 
     async def stop(self, *, drain: bool = True) -> None:
-        self._stopping = True
-        dispatcher = self._dispatcher
-        self._dispatcher = None
-        if dispatcher is not None:
-            dispatcher.cancel()
-            await asyncio.gather(dispatcher, return_exceptions=True)
-        tasks = list(self._active)
-        if tasks:
-            if drain:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            else:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        await self.transport.stop()
+        async with self._lifecycle_lock:
+            self._stopping = True
+            recovery_task = self._recovery_task
+            self._recovery_task = None
+            if recovery_task is not None:
+                recovery_task.cancel()
+                await asyncio.gather(recovery_task, return_exceptions=True)
+            dispatcher = self._dispatcher
+            self._dispatcher = None
+            if dispatcher is not None:
+                dispatcher.cancel()
+                await asyncio.gather(dispatcher, return_exceptions=True)
+            tasks = list(self._active)
+            if tasks:
+                if drain:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            await self.transport.stop()
+
+    async def _recover_pending_publications(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(self.pending_recovery_interval_seconds)
+            if self._stopping:
+                break
+            await self.drain_pending_publications(self.pending_drain_limit)
 
     async def _consume(self) -> None:
         async for message in self.transport.consume(
@@ -524,12 +579,16 @@ class DocumentVectorizeConsumer:
             or record.outbound_payload is None
         ):
             raise RuntimeError("Pending publication record is incomplete")
-        await self.transport.publish(
-            record.outbound_topic,
-            record.outbound_payload,
-            message_id=record.outbound_message_id,
-            headers=record.request_metadata,
-        )
+        try:
+            async with asyncio.timeout(self.publication_timeout_seconds):
+                await self.transport.publish(
+                    record.outbound_topic,
+                    record.outbound_payload,
+                    message_id=record.outbound_message_id,
+                    headers=record.request_metadata,
+                )
+        except TimeoutError as error:
+            raise DeepiriTransportError("Result publication timed out") from error
         return await self.processor.operation_store.mark_published(
             record.idempotency_key
         )
@@ -661,6 +720,14 @@ def _normalize_untrusted_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "Document payload cannot be canonically serialized",
             retryable=False,
         ) from error
+
+
+def _claim_token(record: DocumentOperationRecord) -> str:
+    if record.claim_token is None:
+        raise RuntimeError(
+            f"Owned document operation has no claim token: {record.idempotency_key}"
+        )
+    return record.claim_token
 
 
 def _safe_identity_value(value: Any, fallback: str) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from numbers import Real
@@ -385,6 +386,8 @@ class DocumentVectorizeInput:
 
         _validate_schema_aliases(payload, raw_document)
         metadata = _optional_mapping(payload, "metadata", "metadata")
+        classification = payload.get("classification")
+        _validate_finite_numbers(classification, "classification")
         options = VectorizeOptions.from_payload(payload.get("options"))
         request = cls(
             route_id=route_id,
@@ -414,7 +417,7 @@ class DocumentVectorizeInput:
             artifact_requests=artifact_requests,
             correlation_id=_optional_string(payload, "correlationId", "correlationId"),
             embedding_model=_optional_string(payload, "embeddingModel", "embeddingModel"),
-            classification=payload.get("classification"),
+            classification=classification,
             metadata=metadata,
             options=options,
         )
@@ -824,11 +827,13 @@ def _validate_backend_result(
             raise ValueError(f"Vectorizer returned mismatched chunk id for chunks[{index}]")
         if not isinstance(chunk.vector, list) or not chunk.vector:
             raise ValueError(f"Vectorizer returned an empty vector for chunks[{index}]")
-        if not all(
-            isinstance(value, Real) and not isinstance(value, bool)
-            for value in chunk.vector
-        ):
-            raise ValueError(f"Vectorizer returned a non-numeric vector for chunks[{index}]")
+        for component, value in enumerate(chunk.vector):
+            label = f"chunks[{index}].vector[{component}]"
+            if not isinstance(value, Real) or isinstance(value, bool):
+                raise ValueError(f"Vectorizer returned a non-numeric value for {label}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"Vectorizer returned a non-finite value for {label}")
+        _validate_finite_numbers(chunk.metadata, f"chunks[{index}].metadata", ValueError)
         chunk_dimensions = len(chunk.vector)
         if dimensions is None:
             dimensions = chunk_dimensions
@@ -839,6 +844,19 @@ def _validate_backend_result(
         raise ValueError("Vectorizer returned invalid vector dimensions")
     if request.options.dimensions is not None and request.options.dimensions != dimensions:
         raise ValueError("Vectorizer dimensions do not match requested options.dimensions")
+    for index, artifact in enumerate(request.artifact_requests):
+        requested_dimensions = artifact.parameters.get("dimensions")
+        if (
+            artifact.required
+            and artifact.artifact_type == "embedding"
+            and requested_dimensions is not None
+            and requested_dimensions != dimensions
+        ):
+            raise ValueError(
+                f"artifactRequests[{index}].parameters.dimensions does not match "
+                "the returned embedding dimensions"
+            )
+    _validate_finite_numbers(result.metadata, "backend.metadata", ValueError)
     return dimensions
 
 
@@ -878,7 +896,10 @@ def _required_number(payload: Mapping[str, Any], key: str, label: str) -> float:
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, Real):
         raise DocumentVectorizeValidationError(f"{label} must be a number")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise DocumentVectorizeValidationError(f"{label} must be a finite number")
+    return result
 
 
 def _optional_string(payload: Mapping[str, Any], key: str, label: str | None = None) -> str | None:
@@ -919,7 +940,26 @@ def _optional_mapping(payload: Mapping[str, Any], key: str, label: str) -> dict[
         return {}
     if not isinstance(value, Mapping):
         raise DocumentVectorizeValidationError(f"{label} must be an object")
+    _validate_finite_numbers(value, label)
     return dict(value)
+
+
+def _validate_finite_numbers(
+    value: Any,
+    label: str,
+    error_type: type[ValueError] = DocumentVectorizeValidationError,
+) -> None:
+    if isinstance(value, Real) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            raise error_type(f"{label} must contain only finite numbers")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_finite_numbers(item, f"{label}.{key}", error_type)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_finite_numbers(item, f"{label}[{index}]", error_type)
 
 
 def _vectorizer_provider(vectorizer: Vectorizer) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from typing import Any
 
@@ -20,6 +21,7 @@ from prismpipe.document import (
     DocumentVectorizeProcessor,
     PublicationState,
     SQLiteDocumentOperationStore,
+    StaleDocumentOperationClaimError,
     VectorizeBackendResult,
     VectorizedChunk,
     build_document_idempotency_key,
@@ -679,3 +681,534 @@ async def test_consumer_concurrency_is_bounded_and_shutdown_does_not_ack_unfinis
     )
     stored = await cancel_processor.operation_store.get(key)
     assert stored.status is DocumentOperationStatus.RETRYABLE_FAILURE
+
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_reclaim_fences_stale_worker_updates(tmp_path):
+    release = threading.Event()
+    started = threading.Event()
+
+    class FixedVectorizer(CountingVectorizer):
+        def __init__(self, vector, **kwargs):
+            super().__init__(**kwargs)
+            self.vector = vector
+
+        def vectorize(self, request):
+            with self.lock:
+                self.calls += 1
+                self.requests.append(request)
+                if self.started is not None:
+                    self.started.set()
+            if self.release is not None:
+                self.release.wait()
+            return VectorizeBackendResult(
+                chunks=[
+                    VectorizedChunk(
+                        chunk_id=request.chunks[0].chunk_id,
+                        text=request.chunks[0].text or "",
+                        vector=list(self.vector),
+                    )
+                ],
+                dimensions=len(self.vector),
+            )
+
+    store = SQLiteDocumentOperationStore(
+        tmp_path / "operations.sqlite3",
+        claim_lease_seconds=0.0,
+    )
+    payload = route_payload("fenced")
+    first_processor = DocumentVectorizeProcessor(
+        FixedVectorizer([1.0, 1.0], release=release, started=started),
+        operation_store=store,
+    )
+    second_processor = DocumentVectorizeProcessor(
+        FixedVectorizer([9.0, 9.0]),
+        operation_store=store,
+    )
+    first_task = asyncio.create_task(
+        first_processor.process(payload, message_id="lease-worker-a")
+    )
+    assert await asyncio.to_thread(started.wait, 1.0)
+
+    key = build_document_idempotency_key(
+        payload,
+        message_id="lease-worker-a",
+        headers={"messageId": "lease-worker-a"},
+    )
+    first_claim = await store.get(key)
+    assert first_claim is not None
+    assert first_claim.claim_token is not None
+
+    second_result = await second_processor.process(
+        payload,
+        message_id="lease-worker-b",
+    )
+    assert second_result.success is True
+    assert second_result.record.attempt_count == 2
+    assert second_result.record.result["chunks"][0]["vector"] == [9.0, 9.0]
+
+    with pytest.raises(StaleDocumentOperationClaimError, match="no longer active"):
+        await store.record_retryable_failure(
+            key,
+            first_claim.claim_token,
+            {"code": "STALE_FAILURE", "retryable": True},
+        )
+    with pytest.raises(StaleDocumentOperationClaimError, match="no longer active"):
+        await store.record_retryable_failure(
+            key,
+            first_claim.claim_token,
+            {"code": "CANCELLED", "retryable": True},
+        )
+    with pytest.raises(StaleDocumentOperationClaimError, match="no longer active"):
+        await store.finish(
+            key,
+            claim_token=first_claim.claim_token,
+            status=DocumentOperationStatus.TERMINAL_FAILURE,
+            result=None,
+            error={"code": "STALE_TERMINAL_FAILURE"},
+            outbound_topic=DeepiriStreamTopics.PIPELINE_DEAD_LETTER.value,
+            outbound_message_id="stale-publication",
+            outbound_payload={"success": False},
+        )
+
+    release.set()
+    with pytest.raises(StaleDocumentOperationClaimError, match="no longer active"):
+        await first_task
+
+    final = await store.get(key)
+    assert final is not None
+    assert final.status is DocumentOperationStatus.SUCCEEDED
+    assert final.attempt_count == 2
+    assert final.claim_token is None
+    assert final.error is None
+    assert final.result["chunks"][0]["vector"] == [9.0, 9.0]
+    assert final.publication_state is PublicationState.PENDING
+    assert final.publication_attempts == 0
+    assert final.outbound_message_id == second_result.record.outbound_message_id
+    assert final.outbound_payload["result"]["chunks"][0]["vector"] == [9.0, 9.0]
+
+
+@pytest.mark.asyncio
+async def test_invalid_backend_numbers_are_persisted_only_as_structured_failure(tmp_path):
+    class InvalidBackendVectorizer:
+        provider = "invalid-provider"
+        model = "invalid-model"
+
+        def vectorize(self, request):
+            return VectorizeBackendResult(
+                chunks=[
+                    VectorizedChunk(
+                        chunk_id=request.chunks[0].chunk_id,
+                        text=request.chunks[0].text or "",
+                        vector=[float("nan"), 2.0],
+                    )
+                ],
+                dimensions=2,
+            )
+
+    processor = DocumentVectorizeProcessor(
+        InvalidBackendVectorizer(),
+        operation_store=operation_store(tmp_path),
+    )
+
+    result = await processor.process(route_payload("nan"), message_id="nan-message")
+
+    assert result.record.status is DocumentOperationStatus.TERMINAL_FAILURE
+    assert result.record.result is None
+    assert result.record.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.record.error["retryable"] is False
+    assert "chunks[0].vector[0]" in result.record.error["details"]["error"]
+    assert result.record.publication_state is PublicationState.PENDING
+    assert result.record.outbound_payload["success"] is False
+    assert result.record.outbound_payload["result"] is None
+
+
+class PublicationTrackingTransport(InMemoryDeepiriTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.publication_ids: list[str] = []
+        self.publication_times: list[float] = []
+        self.publication_succeeded = asyncio.Event()
+        self.message_acknowledged = asyncio.Event()
+        self.third_publication_attempt = asyncio.Event()
+
+    async def publish(self, topic, payload, *, message_id, headers=None):
+        self.publication_ids.append(message_id)
+        self.publication_times.append(asyncio.get_running_loop().time())
+        if len(self.publication_ids) >= 3:
+            self.third_publication_attempt.set()
+        await super().publish(
+            topic,
+            payload,
+            message_id=message_id,
+            headers=headers,
+        )
+        self.publication_succeeded.set()
+
+    async def acknowledge(self, message):
+        await super().acknowledge(message)
+        self.message_acknowledged.set()
+
+
+@pytest.mark.asyncio
+async def test_background_recovery_publishes_later_without_revectorizing(tmp_path):
+    transport = PublicationTrackingTransport()
+    transport.fail_publications = 3
+    vectorizer = CountingVectorizer()
+    processor = DocumentVectorizeProcessor(
+        vectorizer,
+        operation_store=operation_store(tmp_path),
+    )
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        processor,
+        max_attempts=3,
+        pending_recovery_interval_seconds=0.03,
+    )
+    payload = route_payload("recover")
+    await consumer.start()
+    await transport.send(
+        DeepiriStreamTopics.DOCUMENT_VECTORIZE.value,
+        DeepiriMessage("recover-message", payload),
+    )
+
+    await asyncio.wait_for(transport.message_acknowledged.wait(), timeout=1.0)
+    key = build_document_idempotency_key(
+        payload,
+        message_id="recover-message",
+        headers={"messageId": "recover-message"},
+    )
+    pending = await processor.operation_store.get(key)
+    assert pending is not None
+    assert pending.status is DocumentOperationStatus.SUCCEEDED
+    assert pending.publication_state is PublicationState.PENDING
+    assert pending.publication_attempts == 3
+
+    await asyncio.wait_for(transport.publication_succeeded.wait(), timeout=1.0)
+    async with asyncio.timeout(1.0):
+        while True:
+            recovered = await processor.operation_store.get(key)
+            if recovered is not None and recovered.publication_state is PublicationState.PUBLISHED:
+                break
+            await asyncio.sleep(0.005)
+    await consumer.stop()
+
+    assert recovered is not None
+    assert recovered.status is DocumentOperationStatus.SUCCEEDED
+    assert recovered.publication_state is PublicationState.PUBLISHED
+    assert vectorizer.calls == 1
+    assert len(transport.publication_ids) == 4
+    assert len(set(transport.publication_ids)) == 1
+    assert transport.publication_ids[0] == pending.outbound_message_id
+    assert consumer._recovery_task is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_publication_failure_is_rate_limited_and_remains_durable(tmp_path):
+    transport = PublicationTrackingTransport()
+    transport.fail_publications = 1000
+    vectorizer = CountingVectorizer()
+    processor = DocumentVectorizeProcessor(
+        vectorizer,
+        operation_store=operation_store(tmp_path),
+    )
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        processor,
+        max_attempts=1,
+        pending_recovery_interval_seconds=0.03,
+    )
+    payload = route_payload("permanent")
+    await consumer.start()
+    await transport.send(
+        DeepiriStreamTopics.DOCUMENT_VECTORIZE.value,
+        DeepiriMessage("permanent-message", payload),
+    )
+
+    await asyncio.wait_for(transport.third_publication_attempt.wait(), timeout=1.0)
+    key = build_document_idempotency_key(
+        payload,
+        message_id="permanent-message",
+        headers={"messageId": "permanent-message"},
+    )
+    async with asyncio.timeout(1.0):
+        while True:
+            stored = await processor.operation_store.get(key)
+            if stored is not None and stored.publication_attempts >= 3:
+                break
+            await asyncio.sleep(0.005)
+    await asyncio.wait_for(consumer.stop(), timeout=0.5)
+    assert stored is not None
+    assert stored.status is DocumentOperationStatus.SUCCEEDED
+    assert stored.publication_state is PublicationState.PENDING
+    assert stored.publication_attempts >= 3
+    assert vectorizer.calls == 1
+    assert len(set(transport.publication_ids)) == 1
+    assert transport.publication_times[1] - transport.publication_times[0] >= 0.02
+    assert transport.publication_times[2] - transport.publication_times[1] >= 0.02
+    assert len(transport.publication_ids) <= 4
+    assert consumer._recovery_task is None
+    assert consumer._active == set()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_batch_is_bounded(tmp_path):
+    vectorizer = CountingVectorizer()
+    processor = DocumentVectorizeProcessor(
+        vectorizer,
+        operation_store=operation_store(tmp_path),
+    )
+    for index in range(3):
+        result = await processor.process(
+            route_payload(f"batch-{index}"),
+            message_id=f"batch-{index}",
+        )
+        assert result.record.publication_state is PublicationState.PENDING
+
+    transport = PublicationTrackingTransport()
+    transport.fail_publications = 100
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        processor,
+        pending_drain_limit=2,
+        pending_recovery_interval_seconds=10.0,
+    )
+
+    await consumer.start()
+    assert len(transport.publication_ids) == 2
+    assert len(await processor.operation_store.pending_publications(limit=10)) == 3
+    await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_blocked_publication_without_losing_outbox(tmp_path):
+    class BlockingPublicationTransport(InMemoryDeepiriTransport):
+        def __init__(self):
+            super().__init__()
+            self.publication_started = asyncio.Event()
+            self.never_release = asyncio.Event()
+
+        async def publish(self, topic, payload, *, message_id, headers=None):
+            self.publication_started.set()
+            await self.never_release.wait()
+
+    transport = BlockingPublicationTransport()
+    vectorizer = CountingVectorizer()
+    processor = DocumentVectorizeProcessor(
+        vectorizer,
+        operation_store=operation_store(tmp_path),
+    )
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        processor,
+        max_attempts=1,
+        pending_recovery_interval_seconds=0.03,
+        publication_timeout_seconds=0.02,
+    )
+    payload = route_payload("blocked-publication")
+    await consumer.start()
+    await transport.send(
+        DeepiriStreamTopics.DOCUMENT_VECTORIZE.value,
+        DeepiriMessage("blocked-publication-message", payload),
+    )
+    await asyncio.wait_for(transport.publication_started.wait(), timeout=1.0)
+
+    await asyncio.wait_for(consumer.stop(), timeout=0.5)
+
+    key = build_document_idempotency_key(
+        payload,
+        message_id="blocked-publication-message",
+        headers={"messageId": "blocked-publication-message"},
+    )
+    stored = await processor.operation_store.get(key)
+    assert stored is not None
+    assert stored.status is DocumentOperationStatus.SUCCEEDED
+    assert stored.publication_state is PublicationState.PENDING
+    assert vectorizer.calls == 1
+    assert transport.acknowledged == ["blocked-publication-message"]
+    assert stored.publication_attempts == 1
+    assert consumer._dispatcher is None
+    assert consumer._recovery_task is None
+    assert consumer._active == set()
+
+
+
+@pytest.mark.asyncio
+async def test_legacy_operation_database_migrates_claim_token_idempotently(tmp_path):
+    database = tmp_path / "legacy-operations.sqlite3"
+    normalized_payload = {"documentId": "legacy-doc"}
+    request_metadata = {"messageId": "legacy-message"}
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE document_operations (
+                operation_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                request_fingerprint TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                manifest_version TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                normalized_payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                result_json TEXT,
+                error_json TEXT,
+                metadata_json TEXT NOT NULL,
+                publication_state TEXT NOT NULL,
+                publication_attempts INTEGER NOT NULL,
+                outbound_topic TEXT,
+                outbound_message_id TEXT,
+                outbound_payload_json TEXT,
+                lease_until TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX document_operations_pending_idx
+            ON document_operations(publication_state, updated_at)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO document_operations (
+                operation_id, idempotency_key, request_fingerprint,
+                document_id, manifest_version, capability,
+                normalized_payload, status, attempt_count,
+                created_at, updated_at, result_json, error_json,
+                metadata_json, publication_state, publication_attempts,
+                outbound_topic, outbound_message_id,
+                outbound_payload_json, lease_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 0, NULL, NULL, NULL, NULL)
+            """,
+            (
+                "legacy-operation",
+                "legacy-key",
+                "legacy-fingerprint",
+                "legacy-doc",
+                "1",
+                "document.vectorize",
+                '{"documentId":"legacy-doc"}',
+                DocumentOperationStatus.RETRYABLE_FAILURE.value,
+                1,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:01+00:00",
+                '{"code":"TEMPORARY_FAILURE"}',
+                '{"messageId":"legacy-message"}',
+                PublicationState.NONE.value,
+            ),
+        )
+        original_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(document_operations)"
+            ).fetchall()
+        }
+    assert "claim_token" not in original_columns
+
+    store = SQLiteDocumentOperationStore(database)
+    with sqlite3.connect(database) as connection:
+        migrated_columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(document_operations)"
+            ).fetchall()
+        ]
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(document_operations)"
+            ).fetchall()
+        }
+    assert migrated_columns.count("claim_token") == 1
+    assert "document_operations_pending_idx" in indexes
+
+    existing = await store.get("legacy-key")
+    assert existing is not None
+    assert existing.operation_id == "legacy-operation"
+    assert existing.normalized_payload == normalized_payload
+    assert existing.request_metadata == request_metadata
+    assert existing.status is DocumentOperationStatus.RETRYABLE_FAILURE
+    assert existing.claim_token is None
+
+    claim = await store.claim(
+        operation_id="legacy-operation",
+        idempotency_key="legacy-key",
+        request_fingerprint="legacy-fingerprint",
+        document_id="legacy-doc",
+        manifest_version="1",
+        capability="document.vectorize",
+        normalized_payload=normalized_payload,
+        request_metadata=request_metadata,
+    )
+    assert claim.owner is True
+    assert claim.record.attempt_count == 2
+    assert claim.record.claim_token is not None
+
+    completed = await store.finish(
+        "legacy-key",
+        claim_token=claim.record.claim_token,
+        status=DocumentOperationStatus.SUCCEEDED,
+        result={"documentId": "legacy-doc", "dimensions": 2},
+        error=None,
+        outbound_topic=DeepiriStreamTopics.DOCUMENT_ARTIFACTS.value,
+        outbound_message_id="legacy-result",
+        outbound_payload={"success": True, "documentId": "legacy-doc"},
+    )
+    assert completed.status is DocumentOperationStatus.SUCCEEDED
+    assert completed.claim_token is None
+    assert completed.publication_state is PublicationState.PENDING
+
+    reopened = SQLiteDocumentOperationStore(database)
+    reopened_record = await reopened.get("legacy-key")
+    assert reopened_record is not None
+    assert reopened_record.status is DocumentOperationStatus.SUCCEEDED
+    assert reopened_record.result == {"documentId": "legacy-doc", "dimensions": 2}
+    assert reopened_record.outbound_message_id == "legacy-result"
+    with sqlite3.connect(database) as connection:
+        reopened_columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(document_operations)"
+            ).fetchall()
+        ]
+    assert reopened_columns.count("claim_token") == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_and_concurrent_start_create_one_recovery_task(tmp_path):
+    transport = InMemoryDeepiriTransport()
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        DocumentVectorizeProcessor(
+            CountingVectorizer(),
+            operation_store=operation_store(tmp_path),
+        ),
+        pending_recovery_interval_seconds=10.0,
+    )
+
+    await asyncio.gather(consumer.start(), consumer.start())
+    dispatcher = consumer._dispatcher
+    recovery_task = consumer._recovery_task
+    assert dispatcher is not None
+    assert recovery_task is not None
+    assert not dispatcher.done()
+    assert not recovery_task.done()
+
+    await consumer.start()
+    assert consumer._dispatcher is dispatcher
+    assert consumer._recovery_task is recovery_task
+
+    dispatcher.cancel()
+    await asyncio.gather(dispatcher, return_exceptions=True)
+    await consumer.start()
+    assert recovery_task.done()
+    assert consumer._dispatcher is not dispatcher
+    assert consumer._recovery_task is not recovery_task
+
+    await consumer.stop()
+    assert consumer._dispatcher is None
+    assert consumer._recovery_task is None

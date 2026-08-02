@@ -26,6 +26,7 @@ from prismpipe.document.operations import (
     IdempotencyConflictError,
     PublicationState,
     SQLiteDocumentOperationStore,
+    StaleDocumentOperationClaimError,
 )
 from prismpipe.document.processing import (
     DocumentProcessingResult,
@@ -60,6 +61,7 @@ __all__ = [
     "IdempotencyConflictError",
     "PublicationState",
     "SQLiteDocumentOperationStore",
+    "StaleDocumentOperationClaimError",
     "DocumentProcessingResult",
     "DocumentVectorizeConsumer",
     "DocumentVectorizeProcessor",
