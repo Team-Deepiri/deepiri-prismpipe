@@ -12,6 +12,7 @@ import pytest
 from prismpipe.deepiri_bus import (
     DeepiriMessage,
     DeepiriStreamTopics,
+    DeepiriTransportError,
     InMemoryDeepiriTransport,
 )
 from prismpipe.document import (
@@ -828,16 +829,11 @@ class PublicationTrackingTransport(InMemoryDeepiriTransport):
     def __init__(self) -> None:
         super().__init__()
         self.publication_ids: list[str] = []
-        self.publication_times: list[float] = []
         self.publication_succeeded = asyncio.Event()
         self.message_acknowledged = asyncio.Event()
-        self.third_publication_attempt = asyncio.Event()
 
     async def publish(self, topic, payload, *, message_id, headers=None):
         self.publication_ids.append(message_id)
-        self.publication_times.append(asyncio.get_running_loop().time())
-        if len(self.publication_ids) >= 3:
-            self.third_publication_attempt.set()
         await super().publish(
             topic,
             payload,
@@ -851,63 +847,53 @@ class PublicationTrackingTransport(InMemoryDeepiriTransport):
         self.message_acknowledged.set()
 
 
+class GatedRecoveryTransport(PublicationTrackingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.initial_publication_failed = asyncio.Event()
+        self.recovery_attempt_started = asyncio.Event()
+        self.allow_recovery_success = asyncio.Event()
+
+    async def publish(self, topic, payload, *, message_id, headers=None):
+        self.publication_ids.append(message_id)
+        if not self.initial_publication_failed.is_set():
+            self.initial_publication_failed.set()
+            raise DeepiriTransportError("Injected initial publication failure")
+        self.recovery_attempt_started.set()
+        await self.allow_recovery_success.wait()
+        await InMemoryDeepiriTransport.publish(
+            self,
+            topic,
+            payload,
+            message_id=message_id,
+            headers=headers,
+        )
+        self.publication_succeeded.set()
+
+
+class PermanentFailureTransport(PublicationTrackingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.initial_publication_failed = asyncio.Event()
+        self.third_recovery_attempt_started = asyncio.Event()
+        self.allow_third_recovery_failure = asyncio.Event()
+        self.recovery_attempt_times: list[float] = []
+
+    async def publish(self, topic, payload, *, message_id, headers=None):
+        self.publication_ids.append(message_id)
+        if not self.initial_publication_failed.is_set():
+            self.initial_publication_failed.set()
+            raise DeepiriTransportError("Injected initial publication failure")
+        self.recovery_attempt_times.append(asyncio.get_running_loop().time())
+        if len(self.recovery_attempt_times) == 3:
+            self.third_recovery_attempt_started.set()
+            await self.allow_third_recovery_failure.wait()
+        raise DeepiriTransportError("Injected permanent publication failure")
+
+
 @pytest.mark.asyncio
 async def test_background_recovery_publishes_later_without_revectorizing(tmp_path):
-    transport = PublicationTrackingTransport()
-    transport.fail_publications = 3
-    vectorizer = CountingVectorizer()
-    processor = DocumentVectorizeProcessor(
-        vectorizer,
-        operation_store=operation_store(tmp_path),
-    )
-    consumer = DocumentVectorizeConsumer(
-        transport,
-        processor,
-        max_attempts=3,
-        pending_recovery_interval_seconds=0.03,
-    )
-    payload = route_payload("recover")
-    await consumer.start()
-    await transport.send(
-        DeepiriStreamTopics.DOCUMENT_VECTORIZE.value,
-        DeepiriMessage("recover-message", payload),
-    )
-
-    await asyncio.wait_for(transport.message_acknowledged.wait(), timeout=1.0)
-    key = build_document_idempotency_key(
-        payload,
-        message_id="recover-message",
-        headers={"messageId": "recover-message"},
-    )
-    pending = await processor.operation_store.get(key)
-    assert pending is not None
-    assert pending.status is DocumentOperationStatus.SUCCEEDED
-    assert pending.publication_state is PublicationState.PENDING
-    assert pending.publication_attempts == 3
-
-    await asyncio.wait_for(transport.publication_succeeded.wait(), timeout=1.0)
-    async with asyncio.timeout(1.0):
-        while True:
-            recovered = await processor.operation_store.get(key)
-            if recovered is not None and recovered.publication_state is PublicationState.PUBLISHED:
-                break
-            await asyncio.sleep(0.005)
-    await consumer.stop()
-
-    assert recovered is not None
-    assert recovered.status is DocumentOperationStatus.SUCCEEDED
-    assert recovered.publication_state is PublicationState.PUBLISHED
-    assert vectorizer.calls == 1
-    assert len(transport.publication_ids) == 4
-    assert len(set(transport.publication_ids)) == 1
-    assert transport.publication_ids[0] == pending.outbound_message_id
-    assert consumer._recovery_task is None
-
-
-@pytest.mark.asyncio
-async def test_permanent_publication_failure_is_rate_limited_and_remains_durable(tmp_path):
-    transport = PublicationTrackingTransport()
-    transport.fail_publications = 1000
+    transport = GatedRecoveryTransport()
     vectorizer = CountingVectorizer()
     processor = DocumentVectorizeProcessor(
         vectorizer,
@@ -919,6 +905,67 @@ async def test_permanent_publication_failure_is_rate_limited_and_remains_durable
         max_attempts=1,
         pending_recovery_interval_seconds=0.03,
     )
+    payload = route_payload("recover")
+    await consumer.start()
+    await transport.send(
+        DeepiriStreamTopics.DOCUMENT_VECTORIZE.value,
+        DeepiriMessage("recover-message", payload),
+    )
+
+    await asyncio.wait_for(transport.initial_publication_failed.wait(), timeout=1.0)
+    await asyncio.wait_for(transport.message_acknowledged.wait(), timeout=1.0)
+    key = build_document_idempotency_key(
+        payload,
+        message_id="recover-message",
+        headers={"messageId": "recover-message"},
+    )
+    pending = await processor.operation_store.get(key)
+    assert pending is not None
+    assert pending.status is DocumentOperationStatus.SUCCEEDED
+    assert pending.publication_state is PublicationState.PENDING
+    assert pending.publication_attempts == 1
+
+    await asyncio.wait_for(transport.recovery_attempt_started.wait(), timeout=1.0)
+    still_pending = await processor.operation_store.get(key)
+    assert still_pending is not None
+    assert still_pending.publication_state is PublicationState.PENDING
+    transport.allow_recovery_success.set()
+    await asyncio.wait_for(transport.publication_succeeded.wait(), timeout=1.0)
+    async with asyncio.timeout(1.0):
+        while True:
+            recovered = await processor.operation_store.get(key)
+            if recovered is not None and recovered.publication_state is PublicationState.PUBLISHED:
+                break
+            await asyncio.sleep(0)
+    await consumer.stop()
+
+    assert recovered is not None
+    assert recovered.status is DocumentOperationStatus.SUCCEEDED
+    assert recovered.publication_state is PublicationState.PUBLISHED
+    assert vectorizer.calls == 1
+    assert transport.publication_ids == [
+        pending.outbound_message_id,
+        pending.outbound_message_id,
+    ]
+    assert consumer._recovery_task is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_publication_failure_is_rate_limited_and_remains_durable(tmp_path):
+    recovery_interval = 0.03
+    scheduler_tolerance = 0.01
+    transport = PermanentFailureTransport()
+    vectorizer = CountingVectorizer()
+    processor = DocumentVectorizeProcessor(
+        vectorizer,
+        operation_store=operation_store(tmp_path),
+    )
+    consumer = DocumentVectorizeConsumer(
+        transport,
+        processor,
+        max_attempts=1,
+        pending_recovery_interval_seconds=recovery_interval,
+    )
     payload = route_payload("permanent")
     await consumer.start()
     await transport.send(
@@ -926,7 +973,14 @@ async def test_permanent_publication_failure_is_rate_limited_and_remains_durable
         DeepiriMessage("permanent-message", payload),
     )
 
-    await asyncio.wait_for(transport.third_publication_attempt.wait(), timeout=1.0)
+    await asyncio.wait_for(transport.initial_publication_failed.wait(), timeout=1.0)
+    await asyncio.wait_for(transport.message_acknowledged.wait(), timeout=1.0)
+    await asyncio.wait_for(
+        transport.third_recovery_attempt_started.wait(),
+        timeout=1.0,
+    )
+    assert len(transport.recovery_attempt_times) == 3
+    transport.allow_third_recovery_failure.set()
     key = build_document_idempotency_key(
         payload,
         message_id="permanent-message",
@@ -935,19 +989,30 @@ async def test_permanent_publication_failure_is_rate_limited_and_remains_durable
     async with asyncio.timeout(1.0):
         while True:
             stored = await processor.operation_store.get(key)
-            if stored is not None and stored.publication_attempts >= 3:
+            if stored is not None and stored.publication_attempts >= 4:
                 break
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0)
     await asyncio.wait_for(consumer.stop(), timeout=0.5)
+
+    recovery_intervals = [
+        later - earlier
+        for earlier, later in zip(
+            transport.recovery_attempt_times,
+            transport.recovery_attempt_times[1:],
+        )
+    ]
     assert stored is not None
     assert stored.status is DocumentOperationStatus.SUCCEEDED
     assert stored.publication_state is PublicationState.PENDING
-    assert stored.publication_attempts >= 3
+    assert stored.publication_attempts == 4
     assert vectorizer.calls == 1
     assert len(set(transport.publication_ids)) == 1
-    assert transport.publication_times[1] - transport.publication_times[0] >= 0.02
-    assert transport.publication_times[2] - transport.publication_times[1] >= 0.02
-    assert len(transport.publication_ids) <= 4
+    assert len(transport.publication_ids) == 4
+    assert len(recovery_intervals) == 2
+    assert all(
+        interval >= recovery_interval - scheduler_tolerance
+        for interval in recovery_intervals
+    )
     assert consumer._recovery_task is None
     assert consumer._active == set()
 
