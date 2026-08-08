@@ -2860,7 +2860,9 @@ class OrganismWatcher:
     
     def __init__(self):
         self._watchers: dict[str, list[Callable[[Organism, str], None]]] = defaultdict(list)
-        self._all_events: list[dict[str, Any]] = []
+        # Lightweight (organism_id, event, datetime, state) tuples on the hot
+        # path; materialized into dicts lazily by get_events.
+        self._all_events: list[tuple[str, str, datetime, dict[str, Any]]] = []
     
     def watch(
         self,
@@ -2870,13 +2872,9 @@ class OrganismWatcher:
         self._watchers[organism_id].append(callback)
     
     def notify(self, organism: Organism, event: str) -> None:
-        event_data = {
-            "organism_id": organism.id,
-            "event": event,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "state": dict(organism.state),
-        }
-        self._all_events.append(event_data)
+        self._all_events.append(
+            (organism.id, event, datetime.now(timezone.utc), dict(organism.state))
+        )
         
         for callback in self._watchers.get(organism.id, []):
             try:
@@ -2889,7 +2887,15 @@ class OrganismWatcher:
         organism_id: str | None = None,
         event: str | None = None,
     ) -> list[dict[str, Any]]:
-        events = self._all_events
+        events = [
+            {
+                "organism_id": oid,
+                "event": ev,
+                "timestamp": ts.isoformat(),
+                "state": state,
+            }
+            for oid, ev, ts, state in self._all_events
+        ]
         
         if organism_id:
             events = [e for e in events if e.get("organism_id") == organism_id]
