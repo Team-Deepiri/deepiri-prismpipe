@@ -363,6 +363,7 @@ class DeepiriAggregateNode(Node):
     """Aggregate downstream probe results into a usefulness report."""
 
     capability = "deepiri.aggregate"
+    offload = False
 
     def process(self, envelope):
         probes = {

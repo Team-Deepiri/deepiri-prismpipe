@@ -150,6 +150,11 @@ class ComputationGraph:
     def _redis_key(self, lookup_key: str) -> str:
         return f"{self._redis_prefix}{lookup_key}"
 
+    @property
+    def redis_enabled(self) -> bool:
+        """True when this graph can share state with other workers via Redis."""
+        return self._redis is not None
+
     def _flight_lock_key(self, lookup_key: str) -> str:
         return f"{self._redis_prefix}sf:{lookup_key}"
 
@@ -317,7 +322,18 @@ class ComputationGraph:
         """Lookup shared computation and return restorable outputs on hit."""
         input_hash = self.compute_input_hash(capability, input_data)
         lookup_key = f"{capability}:{input_hash}"
+        return self.get_cached_result_by_key(
+            capability, lookup_key, use_redis=use_redis
+        )
 
+    def get_cached_result_by_key(
+        self,
+        capability: str,
+        lookup_key: str,
+        *,
+        use_redis: bool = True,
+    ) -> CachedComputation | None:
+        """Lookup by a precomputed `capability:<hash>` key (avoids re-hashing)."""
         if lookup_key in self._hash_to_node:
             node_id = self._hash_to_node[lookup_key]
             node = self._nodes[node_id]
@@ -356,8 +372,10 @@ class ComputationGraph:
         parent_node_id: str | None = None,
         next_capability: str | None = None,
         persist_redis: bool = True,
+        input_hash: str | None = None,
     ) -> ComputationNode:
-        input_hash = self.compute_input_hash(capability, input_data)
+        if input_hash is None:
+            input_hash = self.compute_input_hash(capability, input_data)
         output_hash = hashlib.sha256(
             json.dumps(output_data, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
@@ -893,7 +911,10 @@ class TimeSplitter:
             else:
                 try:
                     node = self._router.resolve(capability)
-                    result = await asyncio.to_thread(node.execute, branch.envelope)
+                    if node.offload:
+                        result = await asyncio.to_thread(node.execute, branch.envelope)
+                    else:
+                        result = node.execute(branch.envelope)
                     branch.state = dict(result.envelope.state)
                     branch.history = list(result.envelope.history)
                     branch._next_capability = result.envelope.next
@@ -1445,7 +1466,6 @@ class OrganismExecutor:
         self._execute_latencies_ms: list[float] = []
         # Single-flight: coalesce concurrent identical cold misses onto one node execute.
         self._inflight: dict[str, asyncio.Future] = {}
-        self._inflight_guard = asyncio.Lock()
         self._warm_steps = 0
         self._cold_steps = 0
         self._single_flight_waits = 0
@@ -1473,30 +1493,25 @@ class OrganismExecutor:
     def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in state.items() if not str(k).startswith("_")}
 
-    def _flight_key(self, capability: str, fingerprint: dict[str, Any]) -> str:
-        return f"{capability}:{json.dumps(fingerprint, sort_keys=True, default=str)}"
-
     async def _await_inflight_or_own(
         self, key: str
     ) -> tuple[bool, asyncio.Future | None]:
         """Return (is_owner, future). Owner must complete and set_result; waiters await."""
-        async with self._inflight_guard:
-            existing = self._inflight.get(key)
-            if existing is not None:
-                return False, existing
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future = loop.create_future()
-            self._inflight[key] = fut
-            return True, fut
+        existing = self._inflight.get(key)
+        if existing is not None:
+            return False, existing
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._inflight[key] = fut
+        return True, fut
 
     async def _finish_inflight(self, key: str, fut: asyncio.Future | None, ok: bool) -> None:
         if fut is None:
             return
         if not fut.done():
             fut.set_result(ok)
-        async with self._inflight_guard:
-            if self._inflight.get(key) is fut:
-                self._inflight.pop(key, None)
+        if self._inflight.get(key) is fut:
+            self._inflight.pop(key, None)
 
     def _record_mutations(
         self,
@@ -1572,7 +1587,13 @@ class OrganismExecutor:
                 before_state = dict(organism.state)
                 fingerprint = self._fingerprint(organism)
                 step_start = time.perf_counter()
-                cached = computation_graph.get_cached_result(capability, fingerprint)
+                lookup_key = (
+                    f"{capability}:"
+                    f"{computation_graph.compute_input_hash(capability, fingerprint)}"
+                )
+                cached = computation_graph.get_cached_result_by_key(
+                    capability, lookup_key
+                )
 
                 if cached:
                     for key, value in cached.state.items():
@@ -1603,14 +1624,10 @@ class OrganismExecutor:
                             )
                         )
                 else:
-                    flight_key = self._flight_key(capability, fingerprint)
-                    lookup_key = (
-                        f"{capability}:"
-                        f"{computation_graph.compute_input_hash(capability, fingerprint)}"
-                    )
+                    flight_key = f"{lookup_key}:sf"
                     while True:
-                        cached = computation_graph.get_cached_result(
-                            capability, fingerprint
+                        cached = computation_graph.get_cached_result_by_key(
+                            capability, lookup_key
                         )
                         if cached is not None:
                             for key, value in cached.state.items():
@@ -1633,37 +1650,45 @@ class OrganismExecutor:
                             organism.state["_from_single_flight"] = True
                             continue
 
-                        # Cross-worker lock: if another replica owns compute, wait on Redis.
-                        redis_owner = await asyncio.to_thread(
-                            computation_graph.try_acquire_flight_lock, lookup_key, 5
-                        )
-                        if not redis_owner:
-                            self._single_flight_waits += 1
-                            waited_hit: CachedComputation | None = None
-                            for _ in range(100):
-                                await asyncio.sleep(0.02)
-                                waited_hit = computation_graph.get_cached_result(
-                                    capability, fingerprint
-                                )
-                                if waited_hit is not None:
-                                    break
-                            await self._finish_inflight(flight_key, fut, True)
-                            if waited_hit is not None:
-                                organism.state["_from_single_flight"] = True
-                                continue
-                            # Timed out — try to steal the lock once more.
+                        # Cross-worker lock: if another replica owns compute, wait on
+                        # Redis. When Redis is not configured there are no other
+                        # replicas to coordinate with, so skip the thread hop
+                        # entirely (the in-process single-flight above still holds).
+                        redis_owner = True
+                        if computation_graph.redis_enabled:
                             redis_owner = await asyncio.to_thread(
-                                computation_graph.try_acquire_flight_lock,
-                                lookup_key,
-                                5,
+                                computation_graph.try_acquire_flight_lock, lookup_key, 5
                             )
                             if not redis_owner:
-                                # Still locked; compute without claiming release duty.
-                                pass
+                                self._single_flight_waits += 1
+                                waited_hit: CachedComputation | None = None
+                                for _ in range(100):
+                                    await asyncio.sleep(0.02)
+                                    waited_hit = computation_graph.get_cached_result(
+                                        capability, fingerprint
+                                    )
+                                    if waited_hit is not None:
+                                        break
+                                await self._finish_inflight(flight_key, fut, True)
+                                if waited_hit is not None:
+                                    organism.state["_from_single_flight"] = True
+                                    continue
+                                # Timed out — try to steal the lock once more.
+                                redis_owner = await asyncio.to_thread(
+                                    computation_graph.try_acquire_flight_lock,
+                                    lookup_key,
+                                    5,
+                                )
+                                if not redis_owner:
+                                    # Still locked; compute without claiming release duty.
+                                    pass
 
                         try:
                             node = self._router.resolve(capability)
-                            result = await asyncio.to_thread(node.execute, envelope)
+                            if node.offload:
+                                result = await asyncio.to_thread(node.execute, envelope)
+                            else:
+                                result = node.execute(envelope)
 
                             envelope = result.envelope
                             organism.state = dict(envelope.state)
@@ -1680,6 +1705,7 @@ class OrganismExecutor:
                                 latency_ms=latency,
                                 success=success,
                                 next_capability=envelope.next,
+                                input_hash=lookup_key.split(":", 1)[-1],
                             )
                             self._cold_steps += 1
                             await self._finish_inflight(flight_key, fut, True)
@@ -1710,7 +1736,7 @@ class OrganismExecutor:
                                 )
                             break
                         finally:
-                            if redis_owner:
+                            if redis_owner and computation_graph.redis_enabled:
                                 await asyncio.to_thread(
                                     computation_graph.release_flight_lock, lookup_key
                                 )

@@ -11,6 +11,7 @@ class BenchComputeNode(Node):
     """Deterministic node for benchmarks / organism API demos."""
 
     capability = "bench.compute"
+    offload = False
 
     def process(self, envelope):
         n = int(envelope.input.get("n", 1))
@@ -23,6 +24,7 @@ class PartitionSumNode(Node):
     """Sum a partition payload — used by swarm benches."""
 
     capability = "bench.partition_sum"
+    offload = False
 
     def process(self, envelope):
         data = envelope.input.get("partition_data", [])
@@ -37,6 +39,7 @@ BenchPartitionNode = PartitionSumNode
 
 class FastBranch(Node):
     capability = "bench.fast"
+    offload = False
 
     def process(self, envelope):
         envelope.state["path"] = "fast"
