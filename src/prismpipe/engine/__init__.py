@@ -1538,7 +1538,6 @@ class OrganismExecutor:
         start_time = time.perf_counter()
         mutation = OrganismMutation(organism.id)
         self._mutations[organism.id] = mutation
-        self._watcher.notify(organism, "spawned")
 
         if self._event_bus is not None:
             intent_str = (
