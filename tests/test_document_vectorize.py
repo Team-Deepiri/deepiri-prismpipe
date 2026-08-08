@@ -255,11 +255,14 @@ async def test_invalid_payload_fails_cleanly_without_backend_call():
     assert error["model"] == "deterministic-v1"
 
 
-def test_missing_chunk_text_raises_document_vectorize_validation_error():
+def test_chunk_without_text_or_storage_raises_document_vectorize_validation_error():
     payload = canonical_payload()
     payload["chunks"][0].pop("text")
 
-    with pytest.raises(DocumentVectorizeValidationError, match=r"chunks\[0\]\.text"):
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match=r"chunks\[0\] must include text or storage",
+    ):
         DocumentVectorizeInput.from_payload(payload)
 
 
@@ -292,7 +295,8 @@ async def test_invalid_backend_dimensions_are_rejected(backend_dimensions):
     assert result.success is False
     assert result.output is None
     assert result.error is not None
-    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["retryable"] is False
     assert result.error["details"]["error"] == "Vectorizer returned invalid vector dimensions"
 
 
@@ -314,7 +318,8 @@ async def test_swapped_backend_chunk_ids_are_rejected():
     assert result.success is False
     assert result.output is None
     assert result.error is not None
-    assert result.error["code"] == "VECTORIZER_ERROR"
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["retryable"] is False
     assert result.error["details"]["error"] == "Vectorizer returned mismatched chunk id for chunks[0]"
 
 
@@ -360,6 +365,7 @@ async def test_output_shape_includes_required_vectorization_fields():
         "provider",
         "model",
         "metadata",
+        "artifacts",
     }
     assert set(output["chunks"][0]) == {"chunkId", "text", "vector", "metadata"}
     assert isinstance(output["chunks"][0]["vector"], list)
@@ -545,7 +551,7 @@ def test_route_schema_fields_fall_back_to_nested_document():
     assert serialized["schemaVersion"] == "nested-1.0"
 
 
-def test_root_route_schema_fields_take_precedence_over_nested_document():
+def test_conflicting_root_and_nested_schema_fields_are_rejected():
     payload = canonical_payload()
     payload["document"].update(
         {
@@ -555,11 +561,11 @@ def test_root_route_schema_fields_take_precedence_over_nested_document():
         }
     )
 
-    parsed = DocumentVectorizeInput.from_payload(payload)
-
-    assert parsed.document_type == "lease"
-    assert parsed.schema_id == "document.route.v1"
-    assert parsed.schema_version == "1.0"
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match="documentType must match document.documentType",
+    ):
+        DocumentVectorizeInput.from_payload(payload)
 
 
 def test_artifact_requests_must_be_a_list():
@@ -567,4 +573,215 @@ def test_artifact_requests_must_be_a_list():
     payload["artifactRequests"] = {"artifactType": "embedding"}
 
     with pytest.raises(DocumentVectorizeValidationError, match="artifactRequests must be a list"):
+        DocumentVectorizeInput.from_payload(payload)
+
+
+
+@pytest.mark.parametrize("quality_score", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_quality_scores_are_rejected(quality_score):
+    payload = canonical_payload()
+    payload["qualityScore"] = quality_score
+
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match="qualityScore must be a finite number",
+    ):
+        DocumentVectorizeInput.from_payload(payload)
+
+
+@pytest.mark.parametrize("quality_score", [0.0, 1.0])
+def test_finite_quality_score_boundaries_are_accepted(quality_score):
+    payload = canonical_payload()
+    payload["qualityScore"] = quality_score
+
+    assert DocumentVectorizeInput.from_payload(payload).quality_score == quality_score
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", [float("nan"), float("inf"), float("-inf")])
+async def test_non_finite_vector_components_are_structured_failures(component):
+    class NonFiniteVectorizer:
+        provider = "non-finite-provider"
+        model = "non-finite-model"
+
+        def vectorize(self, request):
+            return VectorizeBackendResult(
+                chunks=[
+                    VectorizedChunk(
+                        chunk_id=request.chunks[0].chunk_id,
+                        text=request.chunks[0].text or "",
+                        vector=[component, 2.0],
+                    )
+                ],
+                dimensions=2,
+            )
+
+    result = await execute_document_vectorize(
+        PrismEngine(),
+        canonical_payload(),
+        NonFiniteVectorizer(),
+    )
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["retryable"] is False
+    assert result.error["details"]["error"] == (
+        "Vectorizer returned a non-finite value for chunks[0].vector[0]"
+    )
+
+
+@pytest.mark.parametrize("dimensions", [0, -1, True])
+def test_invalid_embedding_artifact_dimensions_are_rejected(dimensions):
+    payload = canonical_payload()
+    payload["artifactRequests"] = [
+        {
+            "artifactType": "embedding",
+            "required": True,
+            "parameters": {"dimensions": dimensions},
+        }
+    ]
+
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match=r"artifactRequests\[0\]\.parameters\.dimensions must be a positive integer",
+    ):
+        DocumentVectorizeInput.from_payload(payload)
+
+
+@pytest.mark.asyncio
+async def test_required_embedding_artifact_dimensions_must_match_result():
+    payload = canonical_payload()
+    payload["artifactRequests"] = [
+        {
+            "artifactType": "embedding",
+            "required": True,
+            "parameters": {"dimensions": 3},
+        }
+    ]
+
+    result = await execute_document_vectorize(
+        PrismEngine(),
+        payload,
+        DeterministicVectorizer(),
+    )
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error["code"] == "VECTORIZER_RESULT_INVALID"
+    assert result.error["details"]["error"] == (
+        "artifactRequests[0].parameters.dimensions does not match "
+        "the returned embedding dimensions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_matching_and_unspecified_embedding_dimensions_keep_existing_behavior():
+    matching = canonical_payload()
+    matching["artifactRequests"] = [
+        {
+            "artifactType": "embedding",
+            "required": True,
+            "parameters": {"dimensions": 2},
+        }
+    ]
+    unspecified = canonical_payload()
+    unspecified["artifactRequests"] = [
+        {"artifactType": "embedding", "required": True}
+    ]
+
+    matching_result = await execute_document_vectorize(
+        PrismEngine(), matching, DeterministicVectorizer()
+    )
+    unspecified_result = await execute_document_vectorize(
+        PrismEngine(), unspecified, DeterministicVectorizer()
+    )
+
+    assert matching_result.success is True
+    assert unspecified_result.success is True
+    assert matching_result.output["artifacts"][0]["status"] == "fulfilled"
+    assert unspecified_result.output["artifacts"][0]["details"]["dimensions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_optional_embedding_dimension_mismatch_preserves_optional_semantics():
+    payload = canonical_payload()
+    payload["artifactRequests"] = [
+        {
+            "artifactType": "embedding",
+            "required": False,
+            "parameters": {"dimensions": 3},
+        }
+    ]
+
+    result = await execute_document_vectorize(
+        PrismEngine(), payload, DeterministicVectorizer()
+    )
+
+    assert result.success is True
+    assert result.output["artifacts"][0] == {
+        "artifactType": "embedding",
+        "status": "fulfilled",
+        "required": False,
+        "details": {
+            "dimensions": 2,
+            "provider": "test-provider",
+            "model": "deterministic-v1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_declared_and_per_chunk_dimensions_must_be_consistent():
+    class InconsistentVectorizer:
+        provider = "inconsistent-provider"
+        model = "inconsistent-model"
+
+        def vectorize(self, request):
+            return VectorizeBackendResult(
+                chunks=[
+                    VectorizedChunk(
+                        chunk_id=request.chunks[0].chunk_id,
+                        text=request.chunks[0].text or "",
+                        vector=[1.0, 2.0],
+                    ),
+                    VectorizedChunk(
+                        chunk_id=request.chunks[1].chunk_id,
+                        text=request.chunks[1].text or "",
+                        vector=[1.0, 2.0, 3.0],
+                    ),
+                ],
+                dimensions=2,
+            )
+
+    payload = canonical_payload()
+    payload["chunks"].append(
+        {"chunkId": "chunk-002", "index": 1, "text": "Second chunk."}
+    )
+
+    result = await execute_document_vectorize(
+        PrismEngine(), payload, InconsistentVectorizer()
+    )
+
+    assert result.success is False
+    assert result.error["details"]["error"] == (
+        "Vectorizer returned inconsistent vector dimensions"
+    )
+
+
+def test_non_finite_artifact_numeric_metadata_is_rejected_with_field_name():
+    payload = canonical_payload()
+    payload["artifactRequests"] = [
+        {
+            "artifactType": "embedding",
+            "parameters": {"confidence": float("nan")},
+        }
+    ]
+
+    with pytest.raises(
+        DocumentVectorizeValidationError,
+        match=r"artifactRequests\[0\]\.parameters\.confidence",
+    ):
         DocumentVectorizeInput.from_payload(payload)
