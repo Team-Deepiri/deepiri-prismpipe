@@ -2658,7 +2658,7 @@ class OrganismMutation:
     
     def __init__(self, organism_id: str):
         self.organism_id = organism_id
-        self.changes: list[dict[str, Any]] = []
+        self.changes: list[tuple[str, str, Any, Any, datetime]] = []
         self._previous_state: dict[str, Any] = {}
     
     def record_change(
@@ -2668,21 +2668,28 @@ class OrganismMutation:
         old_value: Any,
         new_value: Any,
     ) -> None:
-        change = {
-            "capability": capability,
-            "key": key,
-            "old_value": old_value,
-            "new_value": new_value,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self.changes.append(change)
+        # Store raw (capability, key, old, new, datetime) tuples on the hot
+        # path; materialize the dict + isoformat only in get_timeline(), which
+        # runs on the API response path (server.py) and never in the bench loop.
+        self.changes.append(
+            (capability, key, old_value, new_value, datetime.now(timezone.utc))
+        )
         self._previous_state[key] = new_value
     
     def get_timeline(self) -> list[dict[str, Any]]:
-        return self.changes
+        return [
+            {
+                "capability": cap,
+                "key": key,
+                "old_value": old,
+                "new_value": new,
+                "timestamp": ts.isoformat(),
+            }
+            for cap, key, old, new, ts in self.changes
+        ]
     
     def get_changed_keys(self) -> set[str]:
-        return {c["key"] for c in self.changes}
+        return {c[1] for c in self.changes}
 
 
 class StreamingOrganism:
