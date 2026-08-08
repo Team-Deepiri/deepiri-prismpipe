@@ -30,6 +30,12 @@ from prismpipe.core.envelope import (
 from prismpipe.core.node import Node, NodeResult
 from prismpipe.core.router import CapabilityRouter, NodeNotFoundError
 
+# Membership check is ~30x cheaper than try/except around Intent(str) on the
+# hot spawn/execute path (a failed enum construction raises per call).
+_INTENT_VALUES: frozenset[str] = frozenset(
+    member.value for member in Intent
+)
+
 
 def _max_hops() -> int:
     """Hop ceiling for capability-routed loops.
@@ -376,9 +382,14 @@ class ComputationGraph:
     ) -> ComputationNode:
         if input_hash is None:
             input_hash = self.compute_input_hash(capability, input_data)
-        output_hash = hashlib.sha256(
-            json.dumps(output_data, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
+        # output_hash feeds only the redis fan-out path; computing it on every
+        # register is pure waste when redis is absent (the common bench/test run).
+        if persist_redis and self._redis is not None:
+            output_hash = hashlib.sha256(
+                json.dumps(output_data, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+        else:
+            output_hash = ""
 
         node_id = f"comp_{uuid.uuid4().hex[:8]}"
         lookup_key = f"{capability}:{input_hash}"
@@ -588,9 +599,9 @@ class Organism:
     ):
         self.id = f"org_{uuid.uuid4().hex[:12]}"
         if isinstance(intent, str):
-            try:
+            if intent in _INTENT_VALUES:
                 self.intent = Intent(intent)
-            except ValueError:
+            else:
                 self.intent = intent
         else:
             self.intent = intent
@@ -625,9 +636,9 @@ class Organism:
         # Convert intent to enum if it's a custom string
         intent_value = self.intent
         if isinstance(intent_value, str):
-            try:
+            if intent_value in _INTENT_VALUES:
                 intent_value = Intent(intent_value)
-            except ValueError:
+            else:
                 intent_value = Intent.CUSTOM
         
         return RequestEnvelope(
@@ -1549,9 +1560,9 @@ class OrganismExecutor:
 
         intent_value = organism.intent
         if isinstance(intent_value, str):
-            try:
+            if intent_value in _INTENT_VALUES:
                 intent_value = Intent(intent_value)
-            except ValueError:
+            else:
                 intent_value = Intent.CUSTOM
 
         envelope = RequestEnvelope(
