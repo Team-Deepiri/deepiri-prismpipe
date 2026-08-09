@@ -348,6 +348,31 @@ child = organism.spawn_child(patch_input={"filter": "active"})
 - [Architecture](./docs/architecture.md)
 - [Protocol Specification](./docs/protocol.md)
 - [Production Plan](./docs/PRODUCTION_PLAN.md)
+- [Benchmarking](./docs/BENCHMARKING.md)
+- [Go/No-Go Wiring Gate](./docs/GO_NO_GO_WIRING.md)
+
+**Canonical Organic API:** import from `prismpipe`, `prismpipe.engine`, or the
+compat surface `prismpipe.organic_api` (canonical). Do **not** extend any
+separate experimental `prismpipe.organic.*` packages if present — those are
+duplicates, not `organic_api`.
+
+## Deepiri wiring
+
+| Path | Role |
+|------|------|
+| `POST /pipelines/deepiri/session` | **Productivity path:** auth `/auth/verify` ∥ LIS `/health` (one call). Birth-warmed at login. |
+| `GET/POST /pipelines/deepiri/health` | Multi-hop probe: auth∥LIS → cyrex → aggregate |
+| Gateway `/api/prism/pipelines/deepiri/session` | One client RTT: local JWT verify + LIS health (optional `PRISMPIPE_SESSION_WRITE_THROUGH=true`) |
+| Gateway `/api/prism/*` | Proxied when `PRISMPIPE_ENABLED=true` + `PRISMPIPE_URL` |
+| `make prism-gate` | Unit + bench + system regression / usefulness verdict |
+
+```bash
+# from platform root
+make prism-up          # redis + auth + LIS + prismpipe + gateway
+make prism-gate        # prove dedup + (if services up) usefulness
+make prism-gate-full   # bring-up then REQUIRE_GATEWAY=1 gate
+```
+
 
 ---
 

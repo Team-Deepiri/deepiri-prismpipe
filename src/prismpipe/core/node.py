@@ -149,6 +149,10 @@ class Node(ABC, Generic[T]):
     version: str = "1.0.0"
     description: str = ""
     timeout_ms: int | None = None
+    #: When True, the engine runs `execute` off the event loop via a thread hop.
+    #: Set to False for pure-CPU nodes whose `process` never blocks, so the hot
+    #: path skips the thread-pool round trip entirely.
+    offload: bool = True
 
     def __init__(self) -> None:
         self._id = f"{self.__class__.__name__}_{id(self)}"

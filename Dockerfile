@@ -1,19 +1,36 @@
+# PrismPipe — gnu/glibc (python:slim). Embed Bedd via multi-stage FROM.
+# Default: published GHCR image. Compose passes BEDD_IMAGE (see x-bedd-build-args).
+# Do not retag a local build as ghcr.io/team-deepiri/bedd:* — that shadows pulls.
+ARG BEDD_IMAGE=ghcr.io/team-deepiri/bedd:0.8
+FROM ${BEDD_IMAGE} AS bedd
+
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-COPY pyproject.toml README.md requirements.txt ./
-COPY src ./src
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir -e ".[server]"
+# Bedd runtime (Bun-style) — glibc binary for debian/python:slim
+COPY --from=bedd /usr/local/bin/bedd /usr/local/bin/bedd
+COPY --from=bedd /opt/bedd/skills /opt/bedd/skills
+ENV BEDD_SKILLS_DIR=/opt/bedd/skills
+ENV BEDD_BUS_URL=redis://redis:6379
+ENV BEDD_DLQ_STREAM=bedd.dlq
 
-# Copy server
+COPY pyproject.toml poetry.lock requirements.txt README.md ./
+COPY src ./src
+COPY migrations ./migrations
 COPY server.py .
 
-# Expose port
-EXPOSE 8000
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -e ".[all]" \
+    && bedd help >/dev/null
 
-# Run server
-ENV WEB_CONCURRENCY=4
-CMD ["sh", "-c", "gunicorn server:app -k uvicorn.workers.UvicornWorker --bind ${HOST:-0.0.0.0}:${PORT:-8000} --workers ${WEB_CONCURRENCY:-4}"]
+EXPOSE 5011
+
+ENV WEB_CONCURRENCY=2
+# Redis-backed ComputationGraph shares warm hits across workers (COMPUTATION_REDIS_URL/REDIS_URL).
+# Override down to 1 only if Redis is unavailable.
+ENV GUNICORN_TIMEOUT=120
+ENV COMPUTATION_CACHE_TTL_S=30
+ENV PORT=5011
+ENV HOST=0.0.0.0
+CMD ["sh", "-c", "gunicorn server:app -k uvicorn.workers.UvicornWorker --bind ${HOST:-0.0.0.0}:${PORT:-5011} --workers ${WEB_CONCURRENCY:-2} --timeout ${GUNICORN_TIMEOUT:-120}"]

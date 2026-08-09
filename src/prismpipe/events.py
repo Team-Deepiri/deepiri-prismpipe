@@ -3,7 +3,7 @@
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 from enum import Enum
 
@@ -75,7 +75,7 @@ class EventBus:
         """Emit node executed event."""
         await self.publish(Event(
             type=EventType.NODE_EXECUTED if success else EventType.NODE_FAILED,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             data={
                 "capability": capability,
                 "latency_ms": latency_ms,
@@ -88,7 +88,7 @@ class EventBus:
         """Emit request started event."""
         await self.publish(Event(
             type=EventType.REQUEST_STARTED,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             data={
                 "request_id": request_id,
                 "intent": intent,
@@ -99,7 +99,7 @@ class EventBus:
         """Emit request completed event."""
         await self.publish(Event(
             type=EventType.REQUEST_COMPLETED,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             data={
                 "request_id": request_id,
                 "duration_ms": duration_ms,

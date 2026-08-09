@@ -1,0 +1,25 @@
+# PrismPipe benchmark scenarios
+# Thresholds used by scripts/bench/run_bench_gate.sh
+
+scenarios:
+  dedup_identical_100:
+    n: 100
+    min_dedup_ratio: 2.0
+    min_hit_ratio: 0.5
+  lineage_spawn_50:
+    n: 50
+    max_avg_ms: 50.0
+  time_split_3branch:
+    n: 10
+    max_avg_ms: 200.0
+  swarm_mapreduce_1k:
+    n: 1000
+    workers: 8
+    max_error_rate: 0.0
+  persist_hibernate_wake:
+    n: 20
+    max_avg_wake_ms: 50.0
+  http_organism_execute_p95:
+    n: 50
+    concurrency: 8
+    max_p95_ms: 200.0

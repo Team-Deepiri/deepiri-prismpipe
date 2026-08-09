@@ -110,7 +110,7 @@ class RequestEnvelope(BaseModel):
             capability=capability,
             action=action,
             duration_ms=duration_ms,
-            input_snapshot=self.model_dump().get("state"),
+            input_snapshot=dict(self.state),
         )
         self.history.append(entry)
 

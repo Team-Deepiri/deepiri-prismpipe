@@ -3,24 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
-import inspect
 import json
-import math
-import threading
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, AsyncGenerator, Callable
 
 import httpx
-from pydantic import BaseModel
 
 from prismpipe.core.envelope import (
     ExecutionPlan,
@@ -31,9 +27,27 @@ from prismpipe.core.envelope import (
     StateDiff,
     create_envelope,
 )
-from prismpipe.core.node import Node, NodeResult, commit_envelope
-from prismpipe.core.pipeline import PipelineConfig
+from prismpipe.core.node import Node, NodeResult
 from prismpipe.core.router import CapabilityRouter, NodeNotFoundError
+
+# Membership check is ~30x cheaper than try/except around Intent(str) on the
+# hot spawn/execute path (a failed enum construction raises per call).
+_INTENT_VALUES: frozenset[str] = frozenset(
+    member.value for member in Intent
+)
+
+
+def _max_hops() -> int:
+    """Hop ceiling for capability-routed loops.
+
+    Capability routing is cyclic by design (a fault zone re-routes to a heavier
+    producer for another pass), so every routing loop needs a bound or a
+    self-routing capability spins a worker forever.
+    """
+    try:
+        return max(1, int(os.getenv("ORGANISM_MAX_HOPS", "100")))
+    except ValueError:
+        return 100
 
 
 class OrganismState(str, Enum):
@@ -63,178 +77,296 @@ class ComputationNode:
     capability: str
     input_hash: str
     output_hash: str
-    output_envelope: RequestEnvelope | None = None
-    output_state: dict[str, Any] = field(default_factory=dict)
-    next_capability: str | None = None
-    history_entries: list[HistoryEntry] = field(default_factory=list)
     execution_count: int = 1
     avg_latency_ms: float = 0.0
     success_rate: float = 1.0
     child_ids: list[str] = field(default_factory=list)
     parent_id: str | None = None
-    created_at: float = field(default_factory=time.monotonic)
-    last_accessed_at: float = field(default_factory=time.monotonic)
 
 
-class _UnshareableComputation(ValueError):
-    """Raised when an envelope cannot be serialized without ambiguity."""
+@dataclass
+class CachedComputation:
+    """Materialized shared computation ready to restore into an organism."""
 
-
-def _canonicalize_computation_value(value: Any) -> Any:
-    if value is None:
-        return ["none"]
-    if isinstance(value, Enum):
-        return [
-            "enum",
-            f"{type(value).__module__}.{type(value).__qualname__}",
-            _canonicalize_computation_value(value.value),
-        ]
-    if isinstance(value, bool):
-        return ["bool", value]
-    if isinstance(value, int):
-        return ["int", str(value)]
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise _UnshareableComputation("Non-finite floats are not shareable")
-        return ["float", value.hex()]
-    if isinstance(value, str):
-        return ["str", value]
-    if isinstance(value, bytes):
-        return ["bytes", value.hex()]
-    if isinstance(value, datetime):
-        return ["datetime", value.isoformat()]
-    if isinstance(value, date):
-        return ["date", value.isoformat()]
-    if isinstance(value, uuid.UUID):
-        return ["uuid", str(value)]
-    if isinstance(value, BaseModel):
-        fields = [
-            [field_name, _canonicalize_computation_value(getattr(value, field_name))]
-            for field_name in sorted(type(value).model_fields)
-        ]
-        return [
-            "model",
-            f"{type(value).__module__}.{type(value).__qualname__}",
-            fields,
-        ]
-    if isinstance(value, dict):
-        items = [
-            [
-                _canonicalize_computation_value(key),
-                _canonicalize_computation_value(item),
-            ]
-            for key, item in value.items()
-        ]
-        items.sort(
-            key=lambda pair: json.dumps(
-                pair[0],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        return ["dict", items]
-    if isinstance(value, list):
-        return ["list", [_canonicalize_computation_value(item) for item in value]]
-    if isinstance(value, tuple):
-        return ["tuple", [_canonicalize_computation_value(item) for item in value]]
-    if isinstance(value, (set, frozenset)):
-        items = [_canonicalize_computation_value(item) for item in value]
-        items.sort(
-            key=lambda item: json.dumps(
-                item,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        return ["set" if isinstance(value, set) else "frozenset", items]
-    raise _UnshareableComputation(
-        f"Unsupported computation value type: {type(value).__name__}"
-    )
-
-
-def _serialize_computation_value(value: Any) -> str:
-    return json.dumps(
-        _canonicalize_computation_value(value),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    node: ComputationNode
+    state: dict[str, Any]
+    next_capability: str | None = None
 
 
 class ComputationGraph:
-    """Bounded in-memory cache of complete successful envelope computations."""
+    """Shared computation deduplication - compute once, reuse forever.
+
+    Optional Redis backing (`redis_url`) shares hits across gunicorn workers /
+    replicas. Local memory remains an L1 cache; Redis is L2 with TTL.
+    """
 
     def __init__(
         self,
-        max_entries: int = 256,
-        ttl_seconds: float | None = 300.0,
+        redis_url: str | None = None,
+        redis_prefix: str = "prismpipe:cg:",
+        ttl_seconds: int | None = None,
+        redis_client: Any | None = None,
     ) -> None:
-        if max_entries <= 0:
-            raise ValueError("max_entries must be positive")
-        if ttl_seconds is not None and ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive when provided")
-        self.max_entries = max_entries
-        self.ttl_seconds = ttl_seconds
         self._nodes: dict[str, ComputationNode] = {}
-        self._hash_to_node: OrderedDict[str, str] = OrderedDict()
+        self._hash_to_node: dict[str, str] = {}
+        # LRU-ordered. Entries are otherwise only dropped when a lookup happens to
+        # find them expired, so an input nobody queries again is never swept and
+        # the cache grows without bound (one entry per distinct input, forever).
+        self._outputs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._max_entries = max(1, int(os.getenv("COMPUTATION_CACHE_MAX_ENTRIES", "10000")))
+        self._evictions = 0
+        self._hits = 0
+        self._misses = 0
+        self._redis_hits = 0
+        self._negative_hits = 0
         self._capability_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "total_latency": 0.0, "failures": 0}
         )
-        self._lock = threading.RLock()
+        self._redis_prefix = redis_prefix
+        self._ttl_seconds = ttl_seconds
+        if ttl_seconds is None:
+            self._ttl_seconds = int(os.getenv("COMPUTATION_CACHE_TTL_S", "30"))
+        self._negative_ttl_seconds = int(
+            os.getenv("COMPUTATION_NEGATIVE_TTL_S", "3")
+        )
+        # Per-capability TTLs: short for auth-sensitive, longer for health probes.
+        self._ttl_by_capability: dict[str, int] = {
+            "deepiri.session.bootstrap": int(
+                os.getenv("COMPUTATION_TTL_SESSION_S", "15")
+            ),
+            "deepiri.health.parallel": int(
+                os.getenv("COMPUTATION_TTL_HEALTH_S", "30")
+            ),
+            "deepiri.auth.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.lis.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.aggregate": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+            "deepiri.cyrex.health": int(os.getenv("COMPUTATION_TTL_HEALTH_S", "30")),
+        }
+        self._redis = redis_client
+        if self._redis is None and redis_url:
+            try:
+                import redis as redis_sync
 
-    def compute_input_hash(
-        self,
-        capability: str,
-        input_data: dict[str, Any] | None = None,
-        state_data: dict[str, Any] | None = None,
-        version: str | None = None,
-        *,
-        envelope: RequestEnvelope | None = None,
-    ) -> str | None:
-        if envelope is None:
-            return None
+                self._redis = redis_sync.from_url(redis_url, decode_responses=True)
+                self._redis.ping()
+            except Exception:
+                # Fall back to in-process only — never fail engine startup on Redis.
+                self._redis = None
+
+    def _redis_key(self, lookup_key: str) -> str:
+        return f"{self._redis_prefix}{lookup_key}"
+
+    @property
+    def redis_enabled(self) -> bool:
+        """True when this graph can share state with other workers via Redis."""
+        return self._redis is not None
+
+    def _flight_lock_key(self, lookup_key: str) -> str:
+        return f"{self._redis_prefix}sf:{lookup_key}"
+
+    def ttl_for(self, capability: str, *, success: bool = True) -> int:
+        if not success:
+            return max(1, int(self._negative_ttl_seconds))
+        return int(
+            self._ttl_by_capability.get(capability, self._ttl_seconds or 30)
+        )
+
+    def try_acquire_flight_lock(self, lookup_key: str, ttl_s: int = 5) -> bool:
+        """Cross-worker single-flight lock (Redis SET NX). True = caller owns compute."""
+        if self._redis is None:
+            return True
         try:
-            content = _serialize_computation_value(
-                {
-                    "capability": capability,
-                    "version": version,
-                    "envelope": envelope,
-                }
+            return bool(
+                self._redis.set(
+                    self._flight_lock_key(lookup_key),
+                    "1",
+                    nx=True,
+                    ex=max(1, int(ttl_s)),
+                )
             )
         except Exception:
-            return None
-        return hashlib.sha256(content.encode()).hexdigest()
+            return True
+
+    def release_flight_lock(self, lookup_key: str) -> None:
+        if self._redis is None:
+            return
+        try:
+            self._redis.delete(self._flight_lock_key(lookup_key))
+        except Exception:
+            pass
+
+    def compute_input_hash(self, capability: str, input_data: dict[str, Any]) -> str:
+        """Hash capability + input for dedup.
+
+        Expected input shapes are JSON-friendly dicts/lists/primitives (as used by
+        Deepiri probe pipelines). `default=str` is a best-effort fallback for odd
+        values; callers should prefer canonical JSON-serializable payloads so
+        hashes stay deterministic across processes.
+        """
+        content = json.dumps(
+            {"capability": capability, "input": input_data},
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def _store_output(
+        self,
+        node_id: str,
+        lookup_key: str,
+        state: dict[str, Any],
+        next_capability: str | None,
+        success: bool,
+        expires_at: float | None,
+    ) -> None:
+        """Write an L1 entry as most-recently-used and evict down to the bound.
+
+        `lookup_key` is kept on the entry so eviction can drop the matching
+        `_hash_to_node` / `_nodes` rows too — evicting only `_outputs` would
+        leave the other two dicts growing unbounded.
+        """
+        self._outputs[node_id] = {
+            "state": state,
+            "next": next_capability,
+            "success": success,
+            "expires_at": expires_at,
+            "lookup_key": lookup_key,
+        }
+        self._outputs.move_to_end(node_id)
+
+        while len(self._outputs) > self._max_entries:
+            old_id, old = self._outputs.popitem(last=False)
+            old_key = old.get("lookup_key")
+            if old_key is not None and self._hash_to_node.get(old_key) == old_id:
+                self._hash_to_node.pop(old_key, None)
+            self._nodes.pop(old_id, None)
+            self._evictions += 1
 
     def find_shared_computation(
         self,
         capability: str,
-        input_data: dict[str, Any] | None = None,
-        state_data: dict[str, Any] | None = None,
-        version: str | None = None,
-        *,
-        envelope: RequestEnvelope | None = None,
+        input_data: dict[str, Any],
     ) -> ComputationNode | None:
-        input_hash = self.compute_input_hash(
-            capability,
-            input_data,
-            state_data,
-            version,
-            envelope=envelope,
-        )
-        if input_hash is None:
-            return None
+        input_hash = self.compute_input_hash(capability, input_data)
         lookup_key = f"{capability}:{input_hash}"
-        now = time.monotonic()
 
-        with self._lock:
-            self._evict_expired_locked(now)
-            node_id = self._hash_to_node.get(lookup_key)
-            if node_id is None:
-                return None
+        if lookup_key in self._hash_to_node:
+            node_id = self._hash_to_node[lookup_key]
             node = self._nodes[node_id]
             node.execution_count += 1
-            node.last_accessed_at = now
-            self._hash_to_node.move_to_end(lookup_key)
-            return copy.deepcopy(node)
+            return node
+        return None
+
+    def _hydrate_from_redis(self, capability: str, lookup_key: str) -> CachedComputation | None:
+        if self._redis is None:
+            return None
+        redis_key = self._redis_key(lookup_key)
+        try:
+            # GET + TTL in one round trip: the hydrated L1 copy has to inherit the
+            # remaining Redis expiry, or it outlives the TTL it was cached under
+            # and pins a stale result for the life of the worker.
+            pipe = self._redis.pipeline()
+            pipe.get(redis_key)
+            pipe.ttl(redis_key)
+            raw, ttl_remaining = pipe.execute()
+        except Exception:
+            return None
+        if not raw or ttl_remaining == -2:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if ttl_remaining == -1:
+            expires_at = None  # writer deliberately stored it without an expiry
+        elif isinstance(ttl_remaining, int):
+            expires_at = time.time() + max(0, ttl_remaining)
+        else:
+            # TTL unreadable — fall back to the configured capability TTL. Caching
+            # forever is the one option that must never be the default here.
+            expires_at = time.time() + self.ttl_for(capability)
+
+        node_id = payload.get("node_id") or f"comp_redis_{lookup_key[-8:]}"
+        node = self._nodes.get(node_id)
+        if node is None:
+            node = ComputationNode(
+                id=node_id,
+                capability=capability,
+                input_hash=lookup_key.split(":", 1)[-1],
+                output_hash=str(payload.get("output_hash", ""))[:16],
+                avg_latency_ms=float(payload.get("latency_ms", 0.0)),
+                success_rate=1.0 if payload.get("success", True) else 0.0,
+            )
+            self._nodes[node_id] = node
+            self._hash_to_node[lookup_key] = node_id
+        self._store_output(
+            node_id,
+            lookup_key,
+            dict(payload.get("state", {})),
+            payload.get("next"),
+            bool(payload.get("success", True)),
+            expires_at,
+        )
+        node.execution_count += 1
+        self._hits += 1
+        self._redis_hits += 1
+        if not payload.get("success", True):
+            self._negative_hits += 1
+        return CachedComputation(
+            node=node,
+            state=dict(payload.get("state", {})),
+            next_capability=payload.get("next"),
+        )
+
+    def get_cached_result(
+        self,
+        capability: str,
+        input_data: dict[str, Any],
+        *,
+        use_redis: bool = True,
+    ) -> CachedComputation | None:
+        """Lookup shared computation and return restorable outputs on hit."""
+        input_hash = self.compute_input_hash(capability, input_data)
+        lookup_key = f"{capability}:{input_hash}"
+        return self.get_cached_result_by_key(
+            capability, lookup_key, use_redis=use_redis
+        )
+
+    def get_cached_result_by_key(
+        self,
+        capability: str,
+        lookup_key: str,
+        *,
+        use_redis: bool = True,
+    ) -> CachedComputation | None:
+        """Lookup by a precomputed `capability:<hash>` key (avoids re-hashing)."""
+        if lookup_key in self._hash_to_node:
+            node_id = self._hash_to_node[lookup_key]
+            node = self._nodes[node_id]
+            stored = self._outputs.get(node_id)
+            if stored:
+                expires_at = stored.get("expires_at")
+                if expires_at is not None and time.time() >= float(expires_at):
+                    self._hash_to_node.pop(lookup_key, None)
+                    self._outputs.pop(node_id, None)
+                else:
+                    node.execution_count += 1
+                    self._hits += 1
+                    self._outputs.move_to_end(node_id)
+                    if stored.get("success") is False:
+                        self._negative_hits += 1
+                    return CachedComputation(
+                        node=node,
+                        state=dict(stored.get("state", {})),
+                        next_capability=stored.get("next"),
+                    )
+
+        if use_redis:
+            cached = self._hydrate_from_redis(capability, lookup_key)
+            if cached is not None:
+                return cached
+            self._misses += 1
+        return None
 
     def register_computation(
         self,
@@ -244,129 +376,203 @@ class ComputationGraph:
         latency_ms: float,
         success: bool,
         parent_node_id: str | None = None,
-        *,
-        state_data: dict[str, Any] | None = None,
-        version: str | None = None,
         next_capability: str | None = None,
-        history_entries: list[HistoryEntry] | None = None,
-        input_envelope: RequestEnvelope | None = None,
-        output_envelope: RequestEnvelope | None = None,
-    ) -> ComputationNode | None:
-        with self._lock:
-            stats = self._capability_stats[capability]
-            stats["count"] += 1
-            stats["total_latency"] += latency_ms
-            if not success:
-                stats["failures"] += 1
-                return None
-
-        if input_envelope is None or output_envelope is None:
-            return None
-        input_hash = self.compute_input_hash(
-            capability,
-            input_data,
-            state_data,
-            version,
-            envelope=input_envelope,
-        )
+        persist_redis: bool = True,
+        input_hash: str | None = None,
+    ) -> ComputationNode:
         if input_hash is None:
-            return None
+            input_hash = self.compute_input_hash(capability, input_data)
+        # output_hash feeds only the redis fan-out path; computing it on every
+        # register is pure waste when redis is absent (the common bench/test run).
+        if persist_redis and self._redis is not None:
+            output_hash = hashlib.sha256(
+                json.dumps(output_data, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+        else:
+            output_hash = ""
 
-        try:
-            cached_envelope = output_envelope.model_copy(deep=True)
-            serialized_output = _serialize_computation_value(cached_envelope)
-        except Exception:
-            return None
-
-        output_hash = hashlib.sha256(serialized_output.encode()).hexdigest()
+        node_id = f"comp_{uuid.uuid4().hex[:8]}"
         lookup_key = f"{capability}:{input_hash}"
-        now = time.monotonic()
 
-        with self._lock:
-            self._evict_expired_locked(now)
-            existing_id = self._hash_to_node.get(lookup_key)
-            if existing_id is not None:
-                existing = self._nodes[existing_id]
-                existing.avg_latency_ms = (existing.avg_latency_ms + latency_ms) / 2
-                existing.last_accessed_at = now
-                self._hash_to_node.move_to_end(lookup_key)
-                return copy.deepcopy(existing)
+        ttl = self.ttl_for(capability, success=success)
+        expires_at = time.time() + ttl
 
-            node_id = f"comp_{uuid.uuid4().hex[:8]}"
-            node = ComputationNode(
-                id=node_id,
-                capability=capability,
-                input_hash=input_hash,
-                output_hash=output_hash,
-                output_envelope=cached_envelope,
-                output_state=copy.deepcopy(cached_envelope.state),
-                next_capability=cached_envelope.next,
-                history_entries=copy.deepcopy(history_entries or []),
-                avg_latency_ms=latency_ms,
-                parent_id=parent_node_id,
-                created_at=now,
-                last_accessed_at=now,
+        if lookup_key in self._hash_to_node:
+            existing_id = self._hash_to_node[lookup_key]
+            existing = self._nodes[existing_id]
+            existing.execution_count += 1
+            existing.avg_latency_ms = (
+                (existing.avg_latency_ms * (existing.execution_count - 1) + latency_ms)
+                / existing.execution_count
             )
-            self._nodes[node_id] = node
-            self._hash_to_node[lookup_key] = node_id
+            self._store_output(
+                existing_id,
+                lookup_key,
+                dict(output_data),
+                next_capability,
+                success,
+                expires_at,
+            )
+            if persist_redis and self._redis is not None:
+                self._store_redis(
+                    lookup_key,
+                    existing_id,
+                    output_data,
+                    next_capability,
+                    latency_ms,
+                    success,
+                    existing.output_hash or output_hash,
+                    ttl,
+                )
+            return existing
 
-            if parent_node_id and parent_node_id in self._nodes:
-                self._nodes[parent_node_id].child_ids.append(node_id)
+        node = ComputationNode(
+            id=node_id,
+            capability=capability,
+            input_hash=input_hash,
+            output_hash=output_hash,
+            avg_latency_ms=latency_ms,
+            success_rate=1.0 if success else 0.0,
+            parent_id=parent_node_id,
+        )
 
-            self._evict_lru_locked()
-            return copy.deepcopy(node)
+        self._nodes[node_id] = node
+        self._hash_to_node[lookup_key] = node_id
+        self._store_output(
+            node_id,
+            lookup_key,
+            dict(output_data),
+            next_capability,
+            success,
+            expires_at,
+        )
+
+        if parent_node_id and parent_node_id in self._nodes:
+            self._nodes[parent_node_id].child_ids.append(node_id)
+
+        stats = self._capability_stats[capability]
+        stats["count"] += 1
+        stats["total_latency"] += latency_ms
+        if not success:
+            stats["failures"] += 1
+
+        if persist_redis:
+            self._store_redis(
+                lookup_key,
+                node_id,
+                output_data,
+                next_capability,
+                latency_ms,
+                success,
+                output_hash,
+                ttl,
+            )
+
+        return node
+
+    def persist_computation_to_redis(
+        self,
+        capability: str,
+        input_data: dict[str, Any],
+        output_data: dict[str, Any],
+        latency_ms: float,
+        success: bool,
+        next_capability: str | None = None,
+    ) -> None:
+        """Best-effort Redis fan-out after an L1-only register (non-critical path)."""
+        if self._redis is None:
+            return
+        input_hash = self.compute_input_hash(capability, input_data)
+        lookup_key = f"{capability}:{input_hash}"
+        node_id = self._hash_to_node.get(lookup_key)
+        if not node_id:
+            return
+        node = self._nodes.get(node_id)
+        output_hash = node.output_hash if node else ""
+        ttl = self.ttl_for(capability, success=success)
+        self._store_redis(
+            lookup_key,
+            node_id,
+            output_data,
+            next_capability,
+            latency_ms,
+            success,
+            output_hash,
+            ttl,
+        )
+
+    def _store_redis(
+        self,
+        lookup_key: str,
+        node_id: str,
+        output_data: dict[str, Any],
+        next_capability: str | None,
+        latency_ms: float,
+        success: bool,
+        output_hash: str,
+        ttl: int,
+    ) -> None:
+        if self._redis is None:
+            return
+        try:
+            payload = json.dumps(
+                {
+                    "node_id": node_id,
+                    "state": output_data,
+                    "next": next_capability,
+                    "latency_ms": latency_ms,
+                    "success": success,
+                    "output_hash": output_hash,
+                },
+                default=str,
+            )
+            key = self._redis_key(lookup_key)
+            if ttl > 0:
+                self._redis.set(key, payload, ex=ttl)
+            else:
+                self._redis.set(key, payload)
+        except Exception:
+            pass
 
     def get_deduplication_stats(self) -> dict[str, Any]:
-        with self._lock:
-            self._evict_expired_locked(time.monotonic())
-            total_computations = len(self._nodes)
-            total_reuses = sum(node.execution_count - 1 for node in self._nodes.values())
-            capability_stats = {
-                capability: {
-                    "count": stats["count"],
-                    "avg_latency": stats["total_latency"] / max(stats["count"], 1),
-                    "success_rate": 1 - (stats["failures"] / max(stats["count"], 1)),
-                }
-                for capability, stats in self._capability_stats.items()
-            }
+        total_computations = len(self._nodes)
+        total_reuses = sum(n.execution_count - 1 for n in self._nodes.values())
+        lookups = self._hits + self._misses
 
         return {
             "unique_computations": total_computations,
             "total_reuses": total_reuses,
             "deduplication_ratio": total_reuses / max(total_computations, 1),
-            "capability_stats": capability_stats,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_ratio": self._hits / max(lookups, 1),
+            "redis_hits": self._redis_hits,
+            "negative_hits": self._negative_hits,
+            "l1_entries": len(self._outputs),
+            "l1_max_entries": self._max_entries,
+            "evictions": self._evictions,
+            "redis_enabled": self._redis is not None,
+            "ttl_seconds": self._ttl_seconds,
+            "negative_ttl_seconds": self._negative_ttl_seconds,
+            "ttl_by_capability": dict(self._ttl_by_capability),
+            "capability_stats": {
+                cap: {
+                    "count": stats["count"],
+                    "avg_latency": stats["total_latency"] / max(stats["count"], 1),
+                    "success_rate": 1 - (stats["failures"] / max(stats["count"], 1)),
+                }
+                for cap, stats in self._capability_stats.items()
+            },
         }
 
     def get_computation_path(self, node_id: str) -> list[ComputationNode]:
-        with self._lock:
-            path = []
-            current_id = node_id
-            while current_id and current_id in self._nodes:
-                node = self._nodes[current_id]
-                path.insert(0, copy.deepcopy(node))
-                current_id = node.parent_id
-            return path
-
-    def _evict_expired_locked(self, now: float) -> None:
-        if self.ttl_seconds is None:
-            return
-        expired = [
-            lookup_key
-            for lookup_key, node_id in self._hash_to_node.items()
-            if now - self._nodes[node_id].created_at >= self.ttl_seconds
-        ]
-        for lookup_key in expired:
-            self._remove_locked(lookup_key)
-
-    def _evict_lru_locked(self) -> None:
-        while len(self._hash_to_node) > self.max_entries:
-            lookup_key = next(iter(self._hash_to_node))
-            self._remove_locked(lookup_key)
-
-    def _remove_locked(self, lookup_key: str) -> None:
-        node_id = self._hash_to_node.pop(lookup_key, None)
-        if node_id is not None:
-            self._nodes.pop(node_id, None)
+        path = []
+        current_id = node_id
+        while current_id and current_id in self._nodes:
+            node = self._nodes[current_id]
+            path.insert(0, node)
+            current_id = node.parent_id
+        return path
 
 
 class Organism:
@@ -393,9 +599,9 @@ class Organism:
     ):
         self.id = f"org_{uuid.uuid4().hex[:12]}"
         if isinstance(intent, str):
-            try:
+            if intent in _INTENT_VALUES:
                 self.intent = Intent(intent)
-            except ValueError:
+            else:
                 self.intent = intent
         else:
             self.intent = intent
@@ -430,9 +636,9 @@ class Organism:
         # Convert intent to enum if it's a custom string
         intent_value = self.intent
         if isinstance(intent_value, str):
-            try:
+            if intent_value in _INTENT_VALUES:
                 intent_value = Intent(intent_value)
-            except ValueError:
+            else:
                 intent_value = Intent.CUSTOM
         
         return RequestEnvelope(
@@ -639,23 +845,29 @@ class Organism:
 
 
 class TimeSplitter:
-    """Execute a bounded set of speculative branches until the first succeeds."""
+    """
+    EXPLORE MULTIPLE FUTURES IN PARALLEL.
+    
+    Fork execution into multiple branches, first successful wins.
+    
+         organism
+           / | \\
+         A    B  C
+         ↓    ↓   ↓
+      fast  slow crash
+         \\   |   /
+          result ← wins
+    """
 
     def __init__(
         self,
         router: CapabilityRouter,
         max_branches: int = 4,
         timeout_ms: int = 5000,
-        max_iterations: int = 100,
     ) -> None:
-        if max_branches <= 0:
-            raise ValueError("max_branches must be positive")
-        if timeout_ms <= 0:
-            raise ValueError("timeout_ms must be positive")
         self._router = router
         self._max_branches = max_branches
         self._timeout_ms = timeout_ms
-        self._max_iterations = max_iterations
 
     def split(
         self,
@@ -663,25 +875,87 @@ class TimeSplitter:
         branch_capabilities: list[str],
     ) -> list[Organism]:
         branches = []
-        for capability in branch_capabilities[: self._max_branches]:
-            branch = organism.spawn_child(initial_capability=capability)
+        for i, cap in enumerate(branch_capabilities[:self._max_branches]):
+            branch = organism.spawn_child()
+            branch._next_capability = cap
             branch._state = OrganismState.EXPLORING
             branches.append(branch)
         return branches
+
+    def _fingerprint(self, organism: Organism) -> dict[str, Any]:
+        return {
+            "input": organism.input,
+            "state": {
+                k: v for k, v in organism.state.items() if not str(k).startswith("_")
+            },
+        }
 
     async def execute_branch(
         self,
         branch: Organism,
         computation_graph: ComputationGraph,
     ) -> Organism:
-        executor = OrganismExecutor(
-            self._router,
-            PipelineConfig(
-                max_iterations=self._max_iterations,
-                timeout_seconds=self._timeout_ms / 1000,
-            ),
-        )
-        return await executor.execute(branch, computation_graph)
+        start_time = time.perf_counter()
+
+        hops = 0
+        max_hops = _max_hops()
+        while branch._next_capability and not branch.terminated:
+            hops += 1
+            if hops > max_hops:
+                branch.terminate(f"Max hops ({max_hops}) exceeded in branch execution")
+                break
+
+            capability = branch.get_capability()
+            if not capability:
+                break
+
+            fingerprint = self._fingerprint(branch)
+            cached = computation_graph.get_cached_result(capability, fingerprint)
+
+            if cached:
+                for key, value in cached.state.items():
+                    if not str(key).startswith("_"):
+                        branch.state[key] = value
+                branch.state["_from_shared"] = True
+                branch.state["_shared_node_id"] = cached.node.id
+                branch._next_capability = cached.next_capability
+            else:
+                try:
+                    node = self._router.resolve(capability)
+                    if node.offload:
+                        result = await asyncio.to_thread(node.execute, branch.envelope)
+                    else:
+                        result = node.execute(branch.envelope)
+                    branch.state = dict(result.envelope.state)
+                    branch.history = list(result.envelope.history)
+                    branch._next_capability = result.envelope.next
+
+                    latency = (time.perf_counter() - start_time) * 1000
+
+                    computation_graph.register_computation(
+                        capability=capability,
+                        input_data=fingerprint,
+                        output_data={
+                            k: v
+                            for k, v in branch.state.items()
+                            if not str(k).startswith("_")
+                        },
+                        latency_ms=latency,
+                        success=result.success,
+                        next_capability=branch._next_capability,
+                    )
+                    if not result.success or result.envelope.terminated:
+                        branch.terminate(
+                            result.error
+                            or result.envelope.error
+                            or "branch node failed"
+                        )
+                except Exception as e:
+                    branch.terminate(str(e))
+
+        if not branch.terminated:
+            branch._state = OrganismState.LEARNING
+        return branch
 
     async def execute_time_split(
         self,
@@ -690,67 +964,49 @@ class TimeSplitter:
         computation_graph: ComputationGraph,
     ) -> Organism:
         branches = self.split(organism, branch_capabilities)
-        organism._children = branches
-        if not branches:
-            organism.terminate("No eligible time-split branches")
-            return organism
 
-        async def run_branch(branch: Organism) -> Organism:
+        async def run_branch(b: Organism) -> Organism:
             try:
-                return await self.execute_branch(branch, computation_graph)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                branch.terminate(str(error))
-                return branch
+                return await asyncio.wait_for(
+                    self.execute_branch(b, computation_graph),
+                    timeout=self._timeout_ms / 1000.0,
+                )
+            except asyncio.TimeoutError:
+                b.terminate("branch timeout")
+                return b
+            except Exception as e:
+                b.terminate(str(e))
+                return b
 
-        tasks = [
-            asyncio.create_task(run_branch(branch), name=f"prismpipe-branch-{index}")
-            for index, branch in enumerate(branches)
-        ]
-        task_order = {task: index for index, task in enumerate(tasks)}
+        tasks = [asyncio.create_task(run_branch(b)) for b in branches]
+        pending: set[asyncio.Task[Organism]] = set(tasks)
+        winner: Organism | None = None
 
-        try:
-            async with asyncio.timeout(self._timeout_ms / 1000):
-                pending = set(tasks)
-                while pending:
-                    done, pending = await asyncio.wait(
-                        pending,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in sorted(done, key=task_order.__getitem__):
-                        result = task.result()
-                        if result.terminated:
-                            continue
-                        await self._cancel_tasks(pending)
-                        organism.state = copy.deepcopy(result.state)
-                        organism.history = copy.deepcopy(result.history)
-                        organism._next_capability = result._next_capability
-                        organism._state = OrganismState.LEARNING
-                        return organism
-
-            organism.terminate("All time-split branches failed")
-            return organism
-        except TimeoutError:
-            await self._cancel_tasks(tasks)
-            organism.terminate(
-                f"Time split timed out after {self._timeout_ms / 1000:g}s"
+        while pending and winner is None:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
             )
-            return organism
-        except asyncio.CancelledError:
-            await self._cancel_tasks(tasks)
-            raise
-        finally:
-            await self._cancel_tasks(tasks)
+            for task in done:
+                result = task.result()
+                if isinstance(result, Organism) and not result.terminated:
+                    winner = result
+                    break
 
-    @staticmethod
-    async def _cancel_tasks(tasks: Any) -> None:
-        task_list = list(tasks)
-        for task in task_list:
-            if not task.done():
-                task.cancel()
-        if task_list:
-            await asyncio.gather(*task_list, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if winner:
+            organism.state = dict(winner.state)
+            organism.history = list(winner.history)
+            organism._children = branches
+            organism._state = OrganismState.LEARNING
+            organism.state["_time_split_winner"] = winner.id
+            return organism
+
+        organism.terminate("All branches failed")
+        return organism
 
 
 class PipelineEvolver:
@@ -903,25 +1159,21 @@ class IntentPlanner:
 
 
 class SwarmCoordinator:
-    """Execute swarm workers with bounded concurrency and deterministic reduction."""
+    """
+    ORGANISM SWARM COMPUTING.
+    
+    Multiple organisms collaborate on a single problem.
+    Like MapReduce, but request-native.
+    """
 
-    def __init__(
-        self,
-        router: CapabilityRouter | None = None,
-        max_concurrency: int = 4,
-        worker_timeout_seconds: float | None = 30.0,
-        max_iterations: int = 100,
-    ) -> None:
-        if max_concurrency <= 0:
-            raise ValueError("max_concurrency must be positive")
+    def __init__(self, router: CapabilityRouter | None = None) -> None:
         self._router = router
-        self._max_concurrency = max_concurrency
-        self._worker_timeout_seconds = worker_timeout_seconds
-        self._max_iterations = max_iterations
         self._swarms: dict[str, list[Organism]] = {}
         self._shared_state: dict[str, dict[str, Any]] = {}
         self._partition_fn: Callable[[Any], str] | None = None
         self._reducers: dict[str, Callable[[list[Any]], Any]] = {}
+        self._last_error_count = 0
+        self._last_worker_count = 0
 
     def create_swarm(
         self,
@@ -930,9 +1182,9 @@ class SwarmCoordinator:
         count: int,
     ) -> list[Organism]:
         swarm = []
-        for index in range(count):
+        for i in range(count):
             worker = template.spawn_child()
-            worker.id = f"{swarm_id}_worker_{index}"
+            worker.id = f"{swarm_id}_worker_{i}"
             worker._state = OrganismState.EXPLORING
             swarm.append(worker)
 
@@ -952,119 +1204,111 @@ class SwarmCoordinator:
         capability: str,
         computation_graph: ComputationGraph,
         data: list[Any],
+        fail_fast: bool = False,
+        router: CapabilityRouter | None = None,
     ) -> Any:
         if swarm_id not in self._swarms:
             raise ValueError(f"Swarm {swarm_id} not found")
-        if self._router is None:
-            raise RuntimeError("Swarm coordinator has no capability router")
+
+        active_router = router or self._router
+        if active_router is None:
+            raise ValueError("Router required to execute swarm workers")
 
         swarm = self._swarms[swarm_id]
-        if not swarm:
-            raise ValueError(f"Swarm {swarm_id} has no workers")
+        self._last_worker_count = len(swarm)
+        self._last_error_count = 0
 
-        self._assign_partitions(swarm, data)
-        queue: asyncio.Queue[int] = asyncio.Queue()
-        for index in range(len(swarm)):
-            queue.put_nowait(index)
-
-        executor = OrganismExecutor(
-            self._router,
-            PipelineConfig(
-                max_iterations=self._max_iterations,
-                timeout_seconds=self._worker_timeout_seconds,
-            ),
-        )
-        completed: list[Organism | None] = [None] * len(swarm)
-
-        async def run_workers() -> None:
-            while True:
-                try:
-                    index = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-
-                worker = swarm[index]
-                worker.set_next(capability)
-                try:
-                    completed[index] = await executor.execute(worker, computation_graph)
-                except asyncio.CancelledError:
-                    worker._state = OrganismState.SUSPENDED
-                    raise
-                except Exception as error:
-                    worker.terminate(str(error))
-                    completed[index] = worker
-                finally:
-                    queue.task_done()
-
-        tasks = [
-            asyncio.create_task(run_workers(), name=f"prismpipe-swarm-runner-{index}")
-            for index in range(min(self._max_concurrency, len(swarm)))
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            await self._cancel_tasks(tasks)
-            raise
-        except Exception:
-            await self._cancel_tasks(tasks)
-            raise
-        finally:
-            await self._cancel_tasks(tasks)
-
-        successful = [
-            worker
-            for worker in completed
-            if worker is not None and not worker.terminated
-        ]
-        if not successful:
-            failures = [
-                worker.state.get("_error", "worker failed")
-                for worker in completed
-                if worker is not None
-            ]
-            raise RuntimeError(
-                f"All swarm workers failed: {'; '.join(failures) or 'no results'}"
-            )
-
-        reducer = self._reducers.get(swarm_id, lambda workers: workers)
-        try:
-            if inspect.iscoroutinefunction(reducer):
-                return await reducer(successful)
-            reduced = await asyncio.to_thread(reducer, successful)
-            if inspect.isawaitable(reduced):
-                return await reduced
-            return reduced
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            raise RuntimeError(f"Swarm reducer failed: {error}") from error
-
-    def _assign_partitions(self, swarm: list[Organism], data: list[Any]) -> None:
-        worker_partitions: list[list[Any]] = [[] for _ in swarm]
+        partitions: dict[str, list[Any]] = defaultdict(list)
         if self._partition_fn:
-            grouped: dict[str, list[Any]] = {}
             for item in data:
-                key = self._partition_fn(item)
-                grouped.setdefault(key, []).append(item)
-            for index, partition in enumerate(grouped.values()):
-                worker_partitions[index % len(swarm)].extend(partition)
+                partition_key = self._partition_fn(item)
+                partitions[partition_key].append(item)
         else:
-            for index, item in enumerate(data):
-                worker_partitions[index % len(swarm)].append(item)
+            # Round-robin partition across workers when no custom fn
+            for i, item in enumerate(data):
+                partitions[str(i % max(len(swarm), 1))].append(item)
 
-        for worker, partition in zip(swarm, worker_partitions):
-            worker.input["partition_data"] = partition
+        partition_values = list(partitions.values()) if partitions else [[] for _ in swarm]
+        for i, worker in enumerate(swarm):
+            partition_data = (
+                partition_values[i % len(partition_values)] if partition_values else []
+            )
+            worker.input["partition_data"] = partition_data
+            worker.set_next(capability)
 
-    @staticmethod
-    async def _cancel_tasks(tasks: list[asyncio.Task[Any]]) -> None:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        results: list[Any] = []
+        for worker in swarm:
+            fingerprint = {
+                "input": worker.input,
+                "state": {
+                    k: v for k, v in worker.state.items() if not str(k).startswith("_")
+                },
+            }
+            try:
+                cached = computation_graph.get_cached_result(capability, fingerprint)
+                if cached:
+                    for key, value in cached.state.items():
+                        if not str(key).startswith("_"):
+                            worker.state[key] = value
+                    worker.state["_from_shared"] = True
+                    worker._next_capability = cached.next_capability
+                    worker._state = OrganismState.LEARNING
+                    results.append(
+                        worker.state.get("partition_result", worker.state.get("result", worker.state))
+                    )
+                    continue
+
+                node = active_router.resolve(capability)
+                envelope = worker.envelope
+                envelope.next = capability
+                result = node.execute(envelope)
+                worker.state = dict(result.envelope.state)
+                worker.history = list(result.envelope.history)
+                worker._next_capability = result.envelope.next
+
+                computation_graph.register_computation(
+                    capability=capability,
+                    input_data=fingerprint,
+                    output_data={
+                        k: v
+                        for k, v in worker.state.items()
+                        if not str(k).startswith("_")
+                    },
+                    latency_ms=0.0,
+                    success=result.success,
+                    next_capability=worker._next_capability,
+                )
+
+                if not result.success:
+                    self._last_error_count += 1
+                    worker.terminate(result.error or "swarm worker failed")
+                    if fail_fast:
+                        raise RuntimeError(result.error or "swarm worker failed")
+                    continue
+
+                worker._state = OrganismState.LEARNING
+                results.append(
+                    worker.state.get("partition_result", worker.state.get("result", worker.state))
+                )
+            except Exception as e:
+                self._last_error_count += 1
+                worker.terminate(str(e))
+                if fail_fast:
+                    raise
+
+        self._shared_state[swarm_id]["results"] = results
+        reducer = self._reducers.get(swarm_id, lambda x: x)
+        return reducer(results)
 
     def get_swarm_results(self, swarm_id: str) -> list[Organism]:
         return self._swarms.get(swarm_id, [])
+
+    def get_last_swarm_stats(self) -> dict[str, Any]:
+        return {
+            "worker_count": self._last_worker_count,
+            "error_count": self._last_error_count,
+            "error_rate": self._last_error_count / max(self._last_worker_count, 1),
+        }
 
 
 class OrganismRegistry:
@@ -1213,15 +1457,86 @@ class GravityEngine:
 
 
 class OrganismExecutor:
-    """Execute organisms with bounded iterations, deadlines, and safe sharing."""
+    """
+    EXECUTES ORGANISMS THROUGH CAPABILITY PIPELINES.
+    
+    Handles the full lifecycle: spawn → explore → execute → learn → store.
+    """
 
     def __init__(
         self,
         router: CapabilityRouter,
-        config: PipelineConfig | None = None,
+        watcher: OrganismWatcher | None = None,
+        event_bus: Any | None = None,
     ) -> None:
         self._router = router
-        self._config = config or PipelineConfig()
+        self._watcher = watcher if watcher is not None else OrganismWatcher()
+        self._event_bus = event_bus
+        self._max_hops = _max_hops()
+        self._mutations: dict[str, OrganismMutation] = {}
+        self._execute_latencies_ms: list[float] = []
+        # Single-flight: coalesce concurrent identical cold misses onto one node execute.
+        self._inflight: dict[str, asyncio.Future] = {}
+        self._warm_steps = 0
+        self._cold_steps = 0
+        self._single_flight_waits = 0
+        self._useful_true = 0
+        self._useful_false = 0
+        self._downstream_calls_saved = 0
+
+    @property
+    def watcher(self) -> OrganismWatcher:
+        return self._watcher
+
+    def get_mutation(self, organism_id: str) -> OrganismMutation | None:
+        return self._mutations.get(organism_id)
+
+    @staticmethod
+    def _fingerprint(organism: Organism) -> dict[str, Any]:
+        return {
+            "input": organism.input,
+            "state": {
+                k: v for k, v in organism.state.items() if not str(k).startswith("_")
+            },
+        }
+
+    @staticmethod
+    def _public_state(state: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in state.items() if not str(k).startswith("_")}
+
+    async def _await_inflight_or_own(
+        self, key: str
+    ) -> tuple[bool, asyncio.Future | None]:
+        """Return (is_owner, future). Owner must complete and set_result; waiters await."""
+        existing = self._inflight.get(key)
+        if existing is not None:
+            return False, existing
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._inflight[key] = fut
+        return True, fut
+
+    async def _finish_inflight(self, key: str, fut: asyncio.Future | None, ok: bool) -> None:
+        if fut is None:
+            return
+        if not fut.done():
+            fut.set_result(ok)
+        if self._inflight.get(key) is fut:
+            self._inflight.pop(key, None)
+
+    def _record_mutations(
+        self,
+        mutation: OrganismMutation,
+        capability: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> None:
+        keys = set(before) | set(after)
+        for key in keys:
+            old_value = before.get(key)
+            new_value = after.get(key)
+            if old_value != new_value:
+                mutation.record_change(capability, key, old_value, new_value)
 
     async def execute(
         self,
@@ -1229,15 +1544,25 @@ class OrganismExecutor:
         computation_graph: ComputationGraph | None = None,
     ) -> Organism:
         computation_graph = computation_graph or ComputationGraph()
+
         organism._state = OrganismState.EXECUTING
-        started_at = time.monotonic()
-        iterations = 0
+        start_time = time.perf_counter()
+        mutation = OrganismMutation(organism.id)
+        self._mutations[organism.id] = mutation
+
+        if self._event_bus is not None:
+            intent_str = (
+                organism.intent.value
+                if isinstance(organism.intent, Intent)
+                else str(organism.intent)
+            )
+            await self._event_bus.emit_request_started(organism.id, intent_str)
 
         intent_value = organism.intent
         if isinstance(intent_value, str):
-            try:
+            if intent_value in _INTENT_VALUES:
                 intent_value = Intent(intent_value)
-            except ValueError:
+            else:
                 intent_value = Intent.CUSTOM
 
         envelope = RequestEnvelope(
@@ -1252,110 +1577,266 @@ class OrganismExecutor:
             parent_id=organism._parent_organism_id,
         )
 
+        hops = 0
         try:
             while organism._next_capability and not organism.terminated:
-                if iterations >= self._config.max_iterations:
-                    organism._next_capability = None
+                hops += 1
+                if hops > self._max_hops:
                     organism.terminate(
-                        f"Max iterations ({self._config.max_iterations}) exceeded"
+                        f"Max hops ({self._max_hops}) exceeded; last capability="
+                        f"{organism.get_capability()!r}. Raise ORGANISM_MAX_HOPS if "
+                        f"this pipeline legitimately needs more passes."
                     )
-                    break
-
-                remaining_timeout = self._remaining_timeout(started_at)
-                if remaining_timeout is not None and remaining_timeout <= 0:
-                    organism._next_capability = None
-                    organism.terminate(
-                        f"Organism timed out after {self._config.timeout_seconds:g}s"
-                    )
+                    envelope.terminate("max hops exceeded")
                     break
 
                 capability = organism.get_capability()
                 if not capability:
                     break
-                iterations += 1
 
-                try:
-                    node = self._router.resolve(capability)
-                except NodeNotFoundError:
-                    organism._next_capability = None
-                    organism.terminate(f"Node not found: {capability}")
-                    break
-
-                input_envelope = envelope.model_copy(deep=True)
-                shared = computation_graph.find_shared_computation(
-                    capability,
-                    organism.input,
-                    version=node.version,
-                    envelope=envelope,
+                before_state = dict(organism.state)
+                fingerprint = self._fingerprint(organism)
+                step_start = time.perf_counter()
+                lookup_key = (
+                    f"{capability}:"
+                    f"{computation_graph.compute_input_hash(capability, fingerprint)}"
+                )
+                cached = computation_graph.get_cached_result_by_key(
+                    capability, lookup_key
                 )
 
-                if shared is not None and shared.output_envelope is not None:
-                    commit_envelope(envelope, shared.output_envelope)
-                    self._sync_organism_from_envelope(organism, envelope)
-                    organism._computation_node_id = shared.id
+                if cached:
+                    for key, value in cached.state.items():
+                        if not str(key).startswith("_"):
+                            organism.state[key] = value
+                    organism.state["_from_shared"] = True
+                    organism.state["_shared_node_id"] = cached.node.id
+                    organism._computation_node_id = cached.node.id
+                    envelope.state = organism.state
+                    organism._next_capability = cached.next_capability
+                    envelope.next = cached.next_capability
+                    self._warm_steps += 1
+                    # Each warm restore avoids re-running that capability's downstream work.
+                    self._downstream_calls_saved += 1
+
+                    if self._event_bus is not None:
+                        from prismpipe.events import Event, EventType
+
+                        await self._event_bus.publish(
+                            Event(
+                                type=EventType.CACHE_HIT,
+                                timestamp=datetime.now(timezone.utc),
+                                data={
+                                    "capability": capability,
+                                    "request_id": organism.id,
+                                    "shared_node_id": cached.node.id,
+                                },
+                            )
+                        )
                 else:
-                    history_count = len(envelope.history)
-                    node_started_at = time.perf_counter()
-                    result = await node.execute_async(
-                        envelope,
-                        timeout_seconds=remaining_timeout,
-                    )
-                    envelope = result.envelope
-                    self._sync_organism_from_envelope(organism, envelope)
+                    flight_key = f"{lookup_key}:sf"
+                    while True:
+                        cached = computation_graph.get_cached_result_by_key(
+                            capability, lookup_key
+                        )
+                        if cached is not None:
+                            for key, value in cached.state.items():
+                                if not str(key).startswith("_"):
+                                    organism.state[key] = value
+                            organism.state["_from_shared"] = True
+                            organism.state["_shared_node_id"] = cached.node.id
+                            organism._computation_node_id = cached.node.id
+                            envelope.state = organism.state
+                            organism._next_capability = cached.next_capability
+                            envelope.next = cached.next_capability
+                            self._warm_steps += 1
+                            self._downstream_calls_saved += 1
+                            break
 
-                    success = (
-                        result.success
-                        and not envelope.terminated
-                        and envelope.error is None
-                    )
-                    computation_graph.register_computation(
-                        capability=capability,
-                        input_data=organism.input,
-                        output_data=organism.state,
-                        latency_ms=(time.perf_counter() - node_started_at) * 1000,
-                        success=success,
-                        version=node.version,
-                        history_entries=envelope.history[history_count:],
-                        input_envelope=input_envelope,
-                        output_envelope=envelope,
-                    )
+                        is_owner, fut = await self._await_inflight_or_own(flight_key)
+                        if not is_owner and fut is not None:
+                            self._single_flight_waits += 1
+                            await fut
+                            organism.state["_from_single_flight"] = True
+                            continue
 
-                    if not success:
-                        organism._next_capability = None
-                        organism.terminate(result.error or envelope.error)
+                        # Cross-worker lock: if another replica owns compute, wait on
+                        # Redis. When Redis is not configured there are no other
+                        # replicas to coordinate with, so skip the thread hop
+                        # entirely (the in-process single-flight above still holds).
+                        redis_owner = True
+                        if computation_graph.redis_enabled:
+                            redis_owner = await asyncio.to_thread(
+                                computation_graph.try_acquire_flight_lock, lookup_key, 5
+                            )
+                            if not redis_owner:
+                                self._single_flight_waits += 1
+                                waited_hit: CachedComputation | None = None
+                                for _ in range(100):
+                                    await asyncio.sleep(0.02)
+                                    waited_hit = computation_graph.get_cached_result(
+                                        capability, fingerprint
+                                    )
+                                    if waited_hit is not None:
+                                        break
+                                await self._finish_inflight(flight_key, fut, True)
+                                if waited_hit is not None:
+                                    organism.state["_from_single_flight"] = True
+                                    continue
+                                # Timed out — try to steal the lock once more.
+                                redis_owner = await asyncio.to_thread(
+                                    computation_graph.try_acquire_flight_lock,
+                                    lookup_key,
+                                    5,
+                                )
+                                if not redis_owner:
+                                    # Still locked; compute without claiming release duty.
+                                    pass
+
+                        try:
+                            node = self._router.resolve(capability)
+                            if node.offload:
+                                result = await asyncio.to_thread(node.execute, envelope)
+                            else:
+                                result = node.execute(envelope)
+
+                            envelope = result.envelope
+                            organism.state = dict(envelope.state)
+                            organism.history = list(envelope.history)
+                            organism._next_capability = envelope.next
+
+                            latency = (time.perf_counter() - step_start) * 1000
+                            success = result.success and not envelope.terminated
+
+                            computation_graph.register_computation(
+                                capability=capability,
+                                input_data=fingerprint,
+                                output_data=self._public_state(organism.state),
+                                latency_ms=latency,
+                                success=success,
+                                next_capability=envelope.next,
+                                input_hash=lookup_key.split(":", 1)[-1],
+                            )
+                            self._cold_steps += 1
+                            await self._finish_inflight(flight_key, fut, True)
+
+                            if self._event_bus is not None:
+                                await self._event_bus.emit_node_executed(
+                                    capability=capability,
+                                    latency_ms=latency,
+                                    success=success,
+                                    request_id=organism.id,
+                                )
+
+                            if not success:
+                                organism.terminate(
+                                    result.error or envelope.error or "node failed"
+                                )
+                            break
+                        except Exception as e:
+                            await self._finish_inflight(flight_key, fut, False)
+                            organism.terminate(str(e))
+                            if self._event_bus is not None:
+                                await self._event_bus.emit_node_executed(
+                                    capability=capability,
+                                    latency_ms=(time.perf_counter() - step_start)
+                                    * 1000,
+                                    success=False,
+                                    request_id=organism.id,
+                                )
+                            break
+                        finally:
+                            if redis_owner and computation_graph.redis_enabled:
+                                await asyncio.to_thread(
+                                    computation_graph.release_flight_lock, lookup_key
+                                )
+
+                    if organism.terminated:
                         break
 
-                organism._next_capability = envelope.next
+                self._record_mutations(
+                    mutation, capability, before_state, organism.state
+                )
+                self._watcher.notify(organism, "node_executed")
 
-        except asyncio.CancelledError:
-            organism._state = OrganismState.SUSPENDED
+            # Track usefulness when pipelines publish deepiri_report/session.
+            report = organism.state.get("deepiri_report") or organism.state.get("session")
+            if isinstance(report, dict) and "useful" in report:
+                if report.get("useful"):
+                    self._useful_true += 1
+                else:
+                    self._useful_false += 1
+                saved = (
+                    (report.get("productivity") or {}).get("client_round_trips_saved")
+                    if isinstance(report.get("productivity"), dict)
+                    else None
+                )
+                if isinstance(saved, int) and organism.state.get("_from_shared"):
+                    self._downstream_calls_saved += max(0, saved)
+
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            self._execute_latencies_ms.append(duration_ms)
+
+            if organism.terminated:
+                self._watcher.notify(organism, "failed")
+                if self._event_bus is not None:
+                    from prismpipe.events import Event, EventType
+
+                    await self._event_bus.publish(
+                        Event(
+                            type=EventType.REQUEST_FAILED,
+                            timestamp=datetime.now(timezone.utc),
+                            data={
+                                "request_id": organism.id,
+                                "duration_ms": duration_ms,
+                                "error": organism.state.get("_error"),
+                            },
+                        )
+                    )
+            else:
+                organism._state = OrganismState.LEARNING
+                self._watcher.notify(organism, "completed")
+                if self._event_bus is not None:
+                    await self._event_bus.emit_request_completed(
+                        organism.id, duration_ms
+                    )
+        except Exception:
+            organism._state = OrganismState.TERMINATED
+            self._watcher.notify(organism, "failed")
             raise
 
-        if not organism.terminated:
-            organism._state = OrganismState.LEARNING
         return organism
 
-    @staticmethod
-    def _sync_organism_from_envelope(
-        organism: Organism,
-        envelope: RequestEnvelope,
-    ) -> None:
-        organism.id = envelope.id
-        organism.intent = envelope.intent
-        organism.input = copy.deepcopy(envelope.input)
-        organism.state = copy.deepcopy(envelope.state)
-        organism.history = copy.deepcopy(envelope.history)
-        organism.metadata = envelope.metadata.model_copy(deep=True)
-        organism._plan = envelope.plan.model_copy(deep=True)
-        organism._next_capability = envelope.next
-        organism._parent_organism_id = envelope.parent_id
-        if envelope.terminated:
-            organism.terminate(envelope.error)
+    def get_execute_latency_stats(self) -> dict[str, float]:
+        if not self._execute_latencies_ms:
+            return {"count": 0, "p95": 0.0, "p99": 0.0, "avg": 0.0}
+        values = sorted(self._execute_latencies_ms)
+        n = len(values)
 
-    def _remaining_timeout(self, started_at: float) -> float | None:
-        if self._config.timeout_seconds is None:
-            return None
-        return self._config.timeout_seconds - (time.monotonic() - started_at)
+        def percentile(p: float) -> float:
+            idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+            return values[idx]
+
+        return {
+            "count": float(n),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "avg": sum(values) / n,
+        }
+
+    def get_usefulness_stats(self) -> dict[str, Any]:
+        steps = self._warm_steps + self._cold_steps
+        useful_n = self._useful_true + self._useful_false
+        return {
+            "warm_steps": self._warm_steps,
+            "cold_steps": self._cold_steps,
+            "warm_rate": self._warm_steps / max(steps, 1),
+            "single_flight_waits": self._single_flight_waits,
+            "useful_true": self._useful_true,
+            "useful_false": self._useful_false,
+            "useful_rate": self._useful_true / max(useful_n, 1),
+            "downstream_calls_saved": self._downstream_calls_saved,
+        }
 
 
 class ReplayEngine:
@@ -1908,13 +2389,9 @@ class PrismEngine:
 
     def __init__(
         self,
-        config: PipelineConfig | None = None,
-        *,
-        computation_cache_max_entries: int = 256,
-        computation_cache_ttl_seconds: float | None = 300.0,
-        swarm_max_concurrency: int = 4,
+        event_bus: Any | None = None,
+        computation_redis_url: str | None = None,
     ) -> None:
-        self._config = config or PipelineConfig()
         self.router = CapabilityRouter()
         self.replay_engine = ReplayEngine()
         self.diff_engine = DiffEngine()
@@ -1926,21 +2403,24 @@ class PrismEngine:
         self.ancestry_tree = AncestryTree()
         self.semantic_cache = SemanticCache()
 
-        self.computation_graph = ComputationGraph(
-            max_entries=computation_cache_max_entries,
-            ttl_seconds=computation_cache_ttl_seconds,
-        )
+        redis_url = computation_redis_url
+        if redis_url is None:
+            redis_url = os.getenv("COMPUTATION_REDIS_URL") or os.getenv("REDIS_URL")
+        self.computation_graph = ComputationGraph(redis_url=redis_url)
         self.organism_registry = OrganismRegistry()
         self.pipeline_evolver = PipelineEvolver()
         self.intent_planner = IntentPlanner(self.router)
-        self.swarm_coordinator = SwarmCoordinator(
-            self.router,
-            max_concurrency=swarm_max_concurrency,
-            worker_timeout_seconds=self._config.timeout_seconds or 30.0,
-            max_iterations=self._config.max_iterations,
-        )
+        self.swarm_coordinator = SwarmCoordinator(self.router)
         self.gravity_engine = GravityEngine()
-        self.organism_executor = OrganismExecutor(self.router, self._config)
+        self.organism_watcher = OrganismWatcher()
+        self.organism_persistence = OrganismPersistence()
+        self._event_bus = event_bus
+        self.organism_executor = OrganismExecutor(
+            self.router,
+            watcher=self.organism_watcher,
+            event_bus=event_bus,
+        )
+        self._execute_count = 0
 
     def register_node(
         self,
@@ -1949,17 +2429,17 @@ class PrismEngine:
         cost: NodeCost | None = None,
     ) -> "PrismEngine":
         self.router.register(node.capability, node)
-        
+
         if spec:
             self.capability_graph.register(spec)
             self.intent_planner.register_capability(
                 spec.capability,
                 spec.description,
             )
-            
+
         if cost:
             self.cost_optimizer.register_cost(cost)
-            
+
         return self
 
     def spawn_organism(
@@ -1975,11 +2455,12 @@ class PrismEngine:
             initial_capability=initial_capability,
             parent_organism_id=parent_organism_id,
         )
-        
+
         if initial_capability:
             organism._plan.add(initial_capability)
-        
+
         self.organism_registry.register(organism)
+        self.organism_watcher.notify(organism, "spawned")
         return organism
 
     def spawn_organism_from_envelope(
@@ -2003,7 +2484,9 @@ class PrismEngine:
         use_computation_sharing: bool = True,
     ) -> Organism:
         computation = self.computation_graph if use_computation_sharing else ComputationGraph()
-        return await self.organism_executor.execute(organism, computation)
+        result = await self.organism_executor.execute(organism, computation)
+        self._execute_count += 1
+        return result
 
     async def execute_child_organism(
         self,
@@ -2032,21 +2515,16 @@ class PrismEngine:
         self,
         organism: Organism,
         branch_capabilities: list[str],
+        max_branches: int = 4,
+        timeout_ms: int = 5000,
     ) -> Organism:
-        timeout_ms = (
-            int(self._config.timeout_seconds * 1000)
-            if self._config.timeout_seconds is not None
-            else 5000
-        )
         splitter = TimeSplitter(
             self.router,
+            max_branches=max_branches,
             timeout_ms=timeout_ms,
-            max_iterations=self._config.max_iterations,
         )
         return await splitter.execute_time_split(
-            organism,
-            branch_capabilities,
-            self.computation_graph,
+            organism, branch_capabilities, self.computation_graph
         )
 
     def create_swarm(
@@ -2063,9 +2541,15 @@ class PrismEngine:
         swarm_id: str,
         capability: str,
         data: list[Any],
+        fail_fast: bool = False,
     ) -> Any:
         return await self.swarm_coordinator.execute_swarm(
-            swarm_id, capability, self.computation_graph, data
+            swarm_id,
+            capability,
+            self.computation_graph,
+            data,
+            fail_fast=fail_fast,
+            router=self.router,
         )
 
     def plan_intent(self, intent: str) -> list[str]:
@@ -2083,106 +2567,90 @@ class PrismEngine:
         organism: Organism,
     ) -> Organism:
         similar = self.organism_registry.find_similar(organism)
-        
+
         if similar:
             best = similar[0]
             organism.inherit_from(best, inherit_state=True, inherit_knowledge=True)
-            
+
         return organism
 
-    async def execute(self, envelope: RequestEnvelope) -> RequestEnvelope:
-        intent_str = (
-            envelope.intent.value
-            if isinstance(envelope.intent, Intent)
-            else str(envelope.intent)
-        )
+    def get_metrics(self) -> dict[str, Any]:
+        dedup = self.computation_graph.get_deduplication_stats()
+        latency = self.organism_executor.get_execute_latency_stats()
+        useful = self.organism_executor.get_usefulness_stats()
+        swarm = self.swarm_coordinator.get_last_swarm_stats()
+        return {
+            "hit_ratio": dedup.get("hit_ratio", 0.0),
+            "deduplication_ratio": dedup.get("deduplication_ratio", 0.0),
+            "hits": dedup.get("hits", 0),
+            "misses": dedup.get("misses", 0),
+            "unique_computations": dedup.get("unique_computations", 0),
+            "redis_enabled": dedup.get("redis_enabled", False),
+            "redis_hits": dedup.get("redis_hits", 0),
+            "negative_hits": dedup.get("negative_hits", 0),
+            "cache_ttl_seconds": dedup.get("ttl_seconds"),
+            "negative_ttl_seconds": dedup.get("negative_ttl_seconds"),
+            "ttl_by_capability": dedup.get("ttl_by_capability", {}),
+            "execute_p95": latency.get("p95", 0.0),
+            "execute_p99": latency.get("p99", 0.0),
+            "execute_count": self._execute_count,
+            "warm_steps": useful.get("warm_steps", 0),
+            "cold_steps": useful.get("cold_steps", 0),
+            "warm_rate": useful.get("warm_rate", 0.0),
+            "single_flight_waits": useful.get("single_flight_waits", 0),
+            "useful_rate": useful.get("useful_rate", 0.0),
+            "downstream_calls_saved": useful.get("downstream_calls_saved", 0),
+            "swarm_worker_count": swarm.get("worker_count", 0),
+            "swarm_error_rate": swarm.get("error_rate", 0.0),
+            "organism_count": len(self.organism_registry._organisms),
+        }
 
+    async def execute(self, envelope: RequestEnvelope) -> RequestEnvelope:
+        intent_str = envelope.intent.value if isinstance(envelope.intent, Intent) else str(envelope.intent)
+        
         cached = self.semantic_cache.get(intent_str, envelope.input)
+        
         if cached:
             envelope.state["_from_cache"] = True
-            envelope.state["_cached_result"] = copy.deepcopy(cached.state)
+            envelope.state["_cached_result"] = cached.state
             return envelope
-
-        started_at = time.monotonic()
-        iterations = 0
-
-        try:
-            while envelope.next and not envelope.terminated:
-                if iterations >= self._config.max_iterations:
-                    envelope.terminate(
-                        f"Max iterations ({self._config.max_iterations}) exceeded"
-                    )
-                    break
-
-                remaining_timeout = self._remaining_timeout(started_at)
-                if remaining_timeout is not None and remaining_timeout <= 0:
-                    envelope.terminate(
-                        f"Engine execution timed out after "
-                        f"{self._config.timeout_seconds:g}s"
-                    )
-                    break
-
-                capability = envelope.get_capability()
-                if not capability:
-                    break
-                iterations += 1
-                before_state = copy.deepcopy(envelope.state)
-
-                if self.remote_executor.is_remote(capability):
-                    try:
-                        operation = self.remote_executor.execute_remote(
-                            capability,
-                            envelope,
-                        )
-                        if remaining_timeout is None:
-                            envelope = await operation
-                        else:
-                            envelope = await asyncio.wait_for(
-                                operation,
-                                timeout=remaining_timeout,
-                            )
-                    except asyncio.TimeoutError:
-                        envelope.terminate(
-                            f"Remote capability '{capability}' timed out"
-                        )
-                        break
-                else:
-                    try:
-                        node = self.router.resolve(capability)
-                    except NodeNotFoundError:
-                        envelope.terminate(f"Node not found: {capability}")
-                        break
-
-                    result = await node.execute_async(
-                        envelope,
-                        timeout_seconds=remaining_timeout,
-                    )
+            
+        start_state = dict(envelope.state)
+        
+        while envelope.next and not envelope.terminated:
+            capability = envelope.get_capability()
+            if not capability:
+                break
+                
+            if self.remote_executor.is_remote(capability):
+                envelope = await self.remote_executor.execute_remote(capability, envelope)
+            else:
+                try:
+                    node = self.router.resolve(capability)
+                    result = node.execute(envelope)
                     envelope = result.envelope
-                    diff = self.diff_engine.compute_diff(envelope, before_state)
+                    
+                    diff = self.diff_engine.compute_diff(envelope, start_state)
                     self.diff_engine.record(envelope, diff)
-                    if not result.success or envelope.terminated:
-                        envelope.terminate(result.error or envelope.error)
-                        break
-
-                if envelope.plan and envelope.plan.capabilities and not envelope.next:
+                    
+                except NodeNotFoundError:
+                    envelope.terminate(f"Node not found: {capability}")
+                    break
+                    
+            if envelope.plan and envelope.plan.capabilities:
+                if not envelope.next:
                     envelope.next = envelope.plan.next()
-
-        except asyncio.CancelledError:
-            raise
-
+                    
         self.request_memory.store(envelope)
         self.ancestry_tree.add_child(envelope.parent_id or "", envelope.id)
-
-        if envelope.history and not envelope.terminated:
+        
+        if envelope.history:
+            path = [h.capability for h in envelope.history]
             self.semantic_cache.set(intent_str, envelope.input, envelope)
-
+            
         self.replay_engine.snapshot(envelope, f"final_{envelope.id}")
+        
         return envelope
-
-    def _remaining_timeout(self, started_at: float) -> float | None:
-        if self._config.timeout_seconds is None:
-            return None
-        return self._config.timeout_seconds - (time.monotonic() - started_at)
 
 
 class OrganismMutation:
@@ -2190,7 +2658,7 @@ class OrganismMutation:
     
     def __init__(self, organism_id: str):
         self.organism_id = organism_id
-        self.changes: list[dict[str, Any]] = []
+        self.changes: list[tuple[str, str, Any, Any, datetime]] = []
         self._previous_state: dict[str, Any] = {}
     
     def record_change(
@@ -2200,21 +2668,28 @@ class OrganismMutation:
         old_value: Any,
         new_value: Any,
     ) -> None:
-        change = {
-            "capability": capability,
-            "key": key,
-            "old_value": old_value,
-            "new_value": new_value,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self.changes.append(change)
+        # Store raw (capability, key, old, new, datetime) tuples on the hot
+        # path; materialize the dict + isoformat only in get_timeline(), which
+        # runs on the API response path (server.py) and never in the bench loop.
+        self.changes.append(
+            (capability, key, old_value, new_value, datetime.now(timezone.utc))
+        )
         self._previous_state[key] = new_value
     
     def get_timeline(self) -> list[dict[str, Any]]:
-        return self.changes
+        return [
+            {
+                "capability": cap,
+                "key": key,
+                "old_value": old,
+                "new_value": new,
+                "timestamp": ts.isoformat(),
+            }
+            for cap, key, old, new, ts in self.changes
+        ]
     
     def get_changed_keys(self) -> set[str]:
-        return {c["key"] for c in self.changes}
+        return {c[1] for c in self.changes}
 
 
 class StreamingOrganism:
@@ -2248,23 +2723,28 @@ class StreamingOrganism:
 
 class OrganismPersistence:
     """Persist organisms to storage - they can be hibernated and resumed."""
-    
+
     def __init__(self, storage_backend: Any = None):
         self._storage = storage_backend
         self._persisted: dict[str, dict[str, Any]] = {}
-    
-    def hibernate(self, organism: Organism) -> str:
-        """Save organism state and return hibernation ID."""
-        hibernation_id = f"hib_{uuid.uuid4().hex[:8]}"
-        
-        data = {
+
+    def _serialize(self, organism: Organism) -> dict[str, Any]:
+        return {
             "id": organism.id,
-            "intent": organism.intent.value if isinstance(organism.intent, Intent) else str(organism.intent),
+            "intent": organism.intent.value
+            if isinstance(organism.intent, Intent)
+            else str(organism.intent),
             "input": organism.input,
             "state": organism.state,
             "history": [h.model_dump() for h in organism.history],
             "knowledge": [
-                {"key": k.key, "value": k.value, "confidence": k.confidence}
+                {
+                    "key": k.key,
+                    "value": k.value,
+                    "confidence": k.confidence,
+                    "source_capability": k.source_capability,
+                    "tags": list(k.tags),
+                }
                 for k in organism.knowledge
             ],
             "_next_capability": organism._next_capability,
@@ -2272,22 +2752,8 @@ class OrganismPersistence:
             "created_at": organism._created_at.isoformat(),
             "hibernated_at": datetime.now(timezone.utc).isoformat(),
         }
-        
-        self._persisted[hibernation_id] = data
-        
-        if self._storage:
-            # TODO: Write to actual storage
-            pass
-        
-        return hibernation_id
-    
-    def wake(self, hibernation_id: str) -> Organism | None:
-        """Restore organism from hibernation."""
-        if hibernation_id not in self._persisted:
-            return None
-        
-        data = self._persisted[hibernation_id]
-        
+
+    def _deserialize(self, data: dict[str, Any]) -> Organism:
         organism = Organism(
             intent=data["intent"],
             input_data=data["input"],
@@ -2296,16 +2762,53 @@ class OrganismPersistence:
         organism.id = data["id"]
         organism.state = data["state"]
         organism._next_capability = data.get("_next_capability")
-        
         organism.history = [HistoryEntry(**h) for h in data.get("history", [])]
-        
         for k in data.get("knowledge", []):
-            organism.ingest_knowledge(k["key"], k["value"], k["confidence"])
-        
+            organism.ingest_knowledge(
+                k["key"],
+                k["value"],
+                k.get("confidence", 1.0),
+                capability=k.get("source_capability"),
+                tags=k.get("tags"),
+            )
         return organism
-    
+
+    async def hibernate(self, organism: Organism) -> str:
+        """Save organism state and return hibernation ID."""
+        hibernation_id = f"hib_{uuid.uuid4().hex[:8]}"
+        data = self._serialize(organism)
+        self._persisted[hibernation_id] = data
+
+        if self._storage is not None:
+            await self._storage.save(hibernation_id, data)
+
+        organism._state = OrganismState.SUSPENDED
+        return hibernation_id
+
+    async def wake(self, hibernation_id: str) -> Organism | None:
+        """Restore organism from hibernation."""
+        data = self._persisted.get(hibernation_id)
+        if data is None and self._storage is not None:
+            data = await self._storage.load(hibernation_id)
+            if data is not None:
+                self._persisted[hibernation_id] = data
+
+        if data is None:
+            return None
+
+        organism = self._deserialize(data)
+        organism._state = OrganismState.SPAWNED
+        return organism
+
     def list_hibernated(self) -> list[str]:
         return list(self._persisted.keys())
+
+    async def list_hibernated_async(self) -> list[str]:
+        keys = set(self._persisted.keys())
+        if self._storage is not None:
+            stored = await self._storage.list_keys("hib_")
+            keys.update(stored)
+        return sorted(keys)
 
 
 class EventDrivenOrganism:
@@ -2375,7 +2878,9 @@ class OrganismWatcher:
     
     def __init__(self):
         self._watchers: dict[str, list[Callable[[Organism, str], None]]] = defaultdict(list)
-        self._all_events: list[dict[str, Any]] = []
+        # Lightweight (organism_id, event, datetime, state) tuples on the hot
+        # path; materialized into dicts lazily by get_events.
+        self._all_events: list[tuple[str, str, datetime, dict[str, Any]]] = []
     
     def watch(
         self,
@@ -2385,13 +2890,9 @@ class OrganismWatcher:
         self._watchers[organism_id].append(callback)
     
     def notify(self, organism: Organism, event: str) -> None:
-        event_data = {
-            "organism_id": organism.id,
-            "event": event,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "state": dict(organism.state),
-        }
-        self._all_events.append(event_data)
+        self._all_events.append(
+            (organism.id, event, datetime.now(timezone.utc), dict(organism.state))
+        )
         
         for callback in self._watchers.get(organism.id, []):
             try:
@@ -2404,7 +2905,15 @@ class OrganismWatcher:
         organism_id: str | None = None,
         event: str | None = None,
     ) -> list[dict[str, Any]]:
-        events = self._all_events
+        events = [
+            {
+                "organism_id": oid,
+                "event": ev,
+                "timestamp": ts.isoformat(),
+                "state": state,
+            }
+            for oid, ev, ts, state in self._all_events
+        ]
         
         if organism_id:
             events = [e for e in events if e.get("organism_id") == organism_id]
@@ -2418,6 +2927,7 @@ __all__ = [
     "OrganismState",
     "KnowledgeAtom",
     "ComputationNode",
+    "CachedComputation",
     "ComputationGraph",
     "Organism",
     "TimeSplitter",
