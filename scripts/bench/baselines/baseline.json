@@ -1,0 +1,34 @@
+{
+  "dedup_identical_100": {
+    "deduplication_ratio": 99.0,
+    "hit_ratio": 0.99,
+    "hits": 99,
+    "misses": 1,
+    "unique_computations": 1,
+    "wall_ms": 2.764106997346971
+  },
+  "http_organism_execute_p95": {
+    "avg_ms": 0.03296337978099473,
+    "p95_ms": 0.06847600161563605,
+    "p99_ms": 0.13502699584932998
+  },
+  "lineage_spawn_50": {
+    "avg_ms": 0.005526459717657417,
+    "p95_ms": 0.008342998626176268
+  },
+  "persist_hibernate_wake": {
+    "avg_wake_ms": 0.01549855078337714,
+    "p95_wake_ms": 0.060991995269432664
+  },
+  "swarm_mapreduce_1k": {
+    "error_rate": 0.0,
+    "expected": 499500,
+    "reduced": 499500,
+    "wall_ms": 0.506492993736174,
+    "worker_count": 8
+  },
+  "time_split_3branch": {
+    "avg_ms": 0.44888539996463805,
+    "p95_ms": 1.4732039999216795
+  }
+}

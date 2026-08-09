@@ -29,10 +29,15 @@ jobs:
           virtualenvs-in-project: true
 
       - name: Install dependencies
-        run: poetry install --with dev,server --no-interaction
+        run: poetry install --with dev,server --extras storage --no-interaction
 
-      - name: Test with pytest
+      - name: Unit + API + regression tests
         run: poetry run pytest tests/ -v --cov=src/prismpipe --cov-report=xml
+
+      - name: Benchmark gate
+        run: |
+          chmod +x scripts/bench/run_bench_gate.sh
+          ./scripts/bench/run_bench_gate.sh
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4

@@ -1,1 +1,4 @@
-gunicorn
+# Thin Docker bootstrap only — full deps come from pyproject extras:
+#   pip install -e ".[all]"
+# Keep this file free of duplicated package pins (Sorge / Poetry source of truth).
+gunicorn>=22
