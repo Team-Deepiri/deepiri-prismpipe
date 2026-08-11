@@ -1,0 +1,9 @@
+services:
+  deepiri-prismpipe:
+    build: .
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "5011"
+      WEB_CONCURRENCY: "2"
+    ports:
+      - "5011:5011"

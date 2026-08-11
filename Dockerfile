@@ -20,9 +20,8 @@ COPY src ./src
 COPY migrations ./migrations
 COPY server.py .
 
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir -e ".[all]" \
-    && bedd help >/dev/null
+RUN pip install --no-cache-dir poetry && \
+    poetry install
 
 EXPOSE 5011
 
