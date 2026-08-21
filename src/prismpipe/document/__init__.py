@@ -1,5 +1,6 @@
 """Document capability integrations."""
 
+from prismpipe.document.cyrex_vectorizer import CyrexVectorizer, CyrexVectorizerError
 from prismpipe.document.vectorize import (
     DOCUMENT_VECTORIZE_CAPABILITY,
     DOCUMENT_VECTORIZE_INPUT_KEY,
@@ -43,6 +44,8 @@ __all__ = [
     "ArtifactRequest",
     "ArtifactResult",
     "ChunkReference",
+    "CyrexVectorizer",
+    "CyrexVectorizerError",
     "DocumentReference",
     "DocumentVectorizeError",
     "DocumentVectorizeInput",
