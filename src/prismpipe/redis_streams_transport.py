@@ -48,6 +48,7 @@ class RedisStreamsDeepiriTransport:
         self._client: Any | None = None
         self._connected = False
         self._known_groups: set[str] = set()
+        self._entry_ids: dict[str, tuple[str, str]] = {}
 
     @property
     def connected(self) -> bool:
@@ -139,13 +140,12 @@ class RedisStreamsDeepiriTransport:
                         delivery_attempt=int(fields.get(_DELIVERY_ATTEMPT_FIELD, "1")),
                         topic=topic,
                     )
-                    self._entry_ids = getattr(self, "_entry_ids", {})
                     self._entry_ids[fields.get("message_id", entry_id)] = (topic, entry_id)
 
     async def acknowledge(self, message: DeepiriMessage) -> None:
         if not self._connected or self._client is None:
             raise DeepiriTransportError("Deepiri transport is disconnected")
-        entry = getattr(self, "_entry_ids", {}).get(message.message_id)
+        entry = self._entry_ids.get(message.message_id)
         if entry is None:
             return
         topic, entry_id = entry
@@ -164,7 +164,7 @@ class RedisStreamsDeepiriTransport:
             headers=message.headers,
             delivery_attempt=message.delivery_attempt + 1,
         )
-        entry = getattr(self, "_entry_ids", {}).get(message.message_id)
+        entry = self._entry_ids.get(message.message_id)
         if entry is not None:
             _, entry_id = entry
             await self._client.xack(topic, self._consumer_group, entry_id)
