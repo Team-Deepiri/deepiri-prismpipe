@@ -1,19 +1,7 @@
-# PrismPipe — gnu/glibc (python:slim). Embed Bedd via multi-stage FROM.
-# Default: published GHCR image. Compose passes BEDD_IMAGE (see x-bedd-build-args).
-# Do not retag a local build as ghcr.io/team-deepiri/bedd:* — that shadows pulls.
-ARG BEDD_IMAGE=ghcr.io/team-deepiri/bedd:0.8
-FROM ${BEDD_IMAGE} AS bedd
-
+# PrismPipe — gnu/glibc (python:slim).
 FROM python:3.11-slim
 
 WORKDIR /app
-
-# Bedd runtime (Bun-style) — glibc binary for debian/python:slim
-COPY --from=bedd /usr/local/bin/bedd /usr/local/bin/bedd
-COPY --from=bedd /opt/bedd/skills /opt/bedd/skills
-ENV BEDD_SKILLS_DIR=/opt/bedd/skills
-ENV BEDD_BUS_URL=redis://redis:6379
-ENV BEDD_DLQ_STREAM=bedd.dlq
 
 COPY pyproject.toml poetry.lock requirements.txt README.md ./
 COPY src ./src

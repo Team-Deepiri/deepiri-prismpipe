@@ -35,7 +35,15 @@ START_TIME = time.monotonic()
 async def lifespan(_app: FastAPI):
     await warmup_deepiri_http_async()
     await asyncio.to_thread(warmup_computation_graph, engine.computation_graph)
-    yield
+    if _document_vectorize_consumer is not None:
+        await _document_vectorize_consumer.start()
+    try:
+        yield
+    finally:
+        if _document_vectorize_consumer is not None:
+            await _document_vectorize_consumer.stop()
+        if _cyrex_vectorizer is not None:
+            await _cyrex_vectorizer.aclose()
 
 
 app = FastAPI(
@@ -64,6 +72,32 @@ def _configure_persistence() -> None:
 
 
 _configure_persistence()
+
+
+def _configure_document_vectorize_consumer() -> tuple[Any, Any]:
+    """Wire the document.vectorize consumer to a real transport + Cyrex backend.
+
+    Gated on REDIS_URL: without it there is no broker to consume from, so the
+    consumer stays off (e.g. local dev, unit tests) rather than crashing at
+    import time. When present, this is the concrete producer/consumer path
+    for the document.vectorize bus route: LIS publishes chunks, this consumes
+    them, and CyrexVectorizer indexes them into Milvus via Cyrex.
+    """
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return None, None
+
+    from prismpipe.document import CyrexVectorizer, DocumentVectorizeConsumer, DocumentVectorizeProcessor
+    from prismpipe.redis_streams_transport import RedisStreamsDeepiriTransport
+
+    vectorizer = CyrexVectorizer(base_url=os.getenv("CYREX_BASE_URL"))
+    transport = RedisStreamsDeepiriTransport(redis_url=redis_url)
+    processor = DocumentVectorizeProcessor(vectorizer=vectorizer)
+    consumer = DocumentVectorizeConsumer(transport=transport, processor=processor)
+    return consumer, vectorizer
+
+
+_document_vectorize_consumer, _cyrex_vectorizer = _configure_document_vectorize_consumer()
 
 
 # =============================================================================
