@@ -5,8 +5,17 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # dependabot-calm: one PR for all action updates instead of one per action.
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # dependabot-calm: base images stay on their tag; only patch/digest refreshes are proposed.
+    # A new minor/major (python 3.15, postgres 18, redis 8, node 26) is a deliberate upgrade, not an auto-PR.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
