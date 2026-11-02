@@ -19,3 +19,17 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # dependabot-calm: minor and patch updates arrive as one weekly PR; a new major version is a
+    # deliberate upgrade, so it is not proposed automatically. Security updates are not affected.
+    groups:
+      pip:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
