@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, deepiriprodvm]
     outputs:
       should_run: ${{ steps.result.outputs.should_run }}
     steps:
@@ -83,7 +83,7 @@ jobs:
     if: needs.gate.outputs.should_run == 'true'
     timeout-minutes: 20
     name: Analyze (python)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, deepiriprodvm]
 
     steps:
       - name: Checkout repository
